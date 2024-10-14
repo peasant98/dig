@@ -1,0 +1,14 @@
+[project]
+name = "dig"
+version = "0.1.0"
+
+dependencies=[
+    "tqdm",
+    "nerfstudio>=1.1.4"
+]
+
+[tool.setuptools.packages.find]
+include = ["dig*"]
+
+[project.entry-points.'nerfstudio.method_configs']
+dig = 'dig.dig_config:dig_method'
