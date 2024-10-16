@@ -22,6 +22,7 @@ from collections import OrderedDict
 import torch
 from nerfstudio.models.splatfacto import get_viewmat
 import torch.nn.functional as F
+
 @dataclass
 class DiGModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: DiGModel)
@@ -33,7 +34,7 @@ class DiGModelConfig(SplatfactoModelConfig):
     How much to upscale rendered dino for supervision
     """
     num_downscales: int = 0
-    gaussian_dim:int = 64
+    gaussian_dim: int = 64
     """Dimension the gaussians actually store as features"""
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
 
@@ -58,6 +59,7 @@ class DiGModel(SplatfactoModel):
             torch.nn.ReLU(),
             torch.nn.Linear(64, self.config.dim, bias = False)
         )
+        
     def load_state_dict(self, dict, **kwargs):  # type: ignore
         super().load_state_dict(dict, **kwargs)
         # here we need to do some hacky stuff....
@@ -224,7 +226,7 @@ class DiGModel(SplatfactoModel):
             render_mode=render_mode,
             sh_degree=sh_degree_to_use,
             sparse_grad=False,
-            absgrad=self.strategy.absgrad,
+            absgrad=True,
             rasterize_mode=self.config.rasterize_mode,
             tile_size=16
         )
@@ -244,7 +246,7 @@ class DiGModel(SplatfactoModel):
             depth_im = torch.where(alpha > 0, depth_im, 1000).squeeze(0)
         else:
             depth_im = None
-
+        out = {"rgb": rgb.squeeze(0), "depth": depth_im, "accumulation": alpha.squeeze(0), "background": background}
         # Insert DINO stuff
         p_size = 14
         downscale = 1.0 if not self.training else (self.config.dino_rescale_factor*MAX_DINO_SIZE/max(H,W))/p_size
@@ -281,16 +283,16 @@ class DiGModel(SplatfactoModel):
         dino_feats = self.nn(nn_inputs).view(*feat_shape[:-1],-1)
         if not self.training:
             dino_feats[dino_alpha.squeeze(-1) < 0.8] = 0
-        out = {"rgb": rgb.squeeze(0), "depth": depth_im, "accumulation": alpha.squeeze(0), "background": background, "dino":dino_feats.squeeze(0),'dino_alpha':dino_alpha.squeeze(0)}  # type: ignore
-        if hasattr(self,'click_feat') and not self.training and dino_feats is not None:
+        out |= {"dino":dino_feats.squeeze(0),'dino_alpha':dino_alpha.squeeze(0)}  # type: ignore
+        if hasattr(self,'click_feat') and not self.training:
             #compute similarity to click_feat across dino feats
             sim = (dino_feats.squeeze(0) - self.click_feat).pow(2).sum(dim=-1).sqrt()[...,None]
             out['click_similarity'] = sim
-        return out 
+        return out
     
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
-        if outputs['dino'] is not None:
+        if 'dino' in outputs:
             gt = batch['dino']
             gt = resize(gt.permute(2,0,1), (outputs['dino'].shape[0],outputs['dino'].shape[1])).permute(1,2,0)
             loss_dict['dino_loss'] = torch.nn.functional.mse_loss(outputs['dino'],gt)
