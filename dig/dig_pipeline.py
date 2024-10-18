@@ -114,12 +114,8 @@ class DiGPipeline(VanillaPipeline):
 
             self.viewer_control = ViewerControl()
 
-            self.a_interaction_method = ViewerDropdown(
-                "Interaction Method",
-                default_value="Interactive",
-                options=["Interactive", "Clustering"],
-                cb_hook=self._update_interaction_method
-            )
+            self.a_segment_done_button = ViewerButtonGroup(name="Selection Type", cb_hook=self._update_interaction_method, default_value = 'Click',options=['Click','Cluster'])
+            
 
             self.click_gaussian = ViewerButton(name="Click", cb_hook=self._click_gaussian)
             self.click_location = None
@@ -129,19 +125,18 @@ class DiGPipeline(VanillaPipeline):
             self.crop_to_group_level = ViewerSlider(name="Group Level", min_value=0, max_value=29, step=1, default_value=0, cb_hook=self._update_crop_vis, disabled=True)
             self.crop_group_list = []
 
-            self.cluster_scene = ViewerButton(name="Cluster Scene", cb_hook=self._cluster_scene, disabled=False, visible=False)
+            self.cluster_scene_z = ViewerButton(name="Cluster Scene", cb_hook=self._cluster_scene, disabled=False, visible=False)
             self.cluster_scene_scale = ViewerSlider(name="Cluster Scale", min_value=0.0, max_value=2.0, step=0.01, default_value=0.0, disabled=False, visible=False)
-            self.cluster_scene_shuffle_colors = ViewerButton(name="Reshuffle Cluster Colors", cb_hook=self._reshuffle_cluster_colors, disabled=False, visible=False)
+            self.z_cluster_scene_shuffle_colors = ViewerButton(name="Reshuffle Cluster Colors", cb_hook=self._reshuffle_cluster_colors, disabled=False, visible=False)
             self.cluster_labels = None
 
-            self.reset_state = ViewerButton(name="Reset State", cb_hook=self._reset_state, disabled=True)
+            self.d_reset_state = ViewerButton(name="Undo", cb_hook=self._reset_state, disabled=True)
 
             dataset_name = config.datamanager.data.stem
             save_state_dir = Path(f"outputs/{dataset_name}")
             save_state_dir.mkdir(parents=True, exist_ok=True)
             self.state_file = save_state_dir / "state.pt"
-            self.z_b = ViewerButton("Save Current State",visible=True,cb_hook=self.save_state)
-            self.z_c = ViewerButton("Load State", cb_hook=lambda _:self.load_state(), visible=True)
+            self.load_button = ViewerButton("Load State", cb_hook=lambda _:self.load_state(), visible=True)
     
     @property
     def has_garfield(self):
@@ -149,7 +144,7 @@ class DiGPipeline(VanillaPipeline):
 
     def save_state(self, _):
         """Save the current state of the model."""
-        """the only thing I need to save is the mask?"""
+        print("Saving state...")
         #save the current state
         params_to_save = {}
         for k, v in self.model.gauss_params.items():
@@ -159,6 +154,7 @@ class DiGPipeline(VanillaPipeline):
         params_to_save["cluster_labels"] = self.cluster_labels
 
         torch.save(params_to_save, self.state_file)
+        print(f"State saved to {self.state_file}")
 
     def load_state(self):
         self._queue_state()
@@ -166,10 +162,8 @@ class DiGPipeline(VanillaPipeline):
         for name in self.model.gauss_params.keys():
             self.model.gauss_params[name] = loaded_state[name].clone().to(self.device)
         self.cluster_labels = loaded_state["cluster_labels"]
-        self._queue_state()
     
     def reset_colors(self):
-        #super jank, find nearest neighbor gaussian to original
         from cuml.neighbors import NearestNeighbors
         model = NearestNeighbors(n_neighbors=1)
         original_means = self.state_stack[0]["means"].detach().cpu().numpy()
@@ -182,18 +176,17 @@ class DiGPipeline(VanillaPipeline):
         self.model.gauss_params["features_rest"] = original_features_rest[match_ids.squeeze()].cuda()
         match_ids = torch.tensor(match_ids,dtype=torch.long,device='cuda')
     
-    def _update_interaction_method(self, dropdown: ViewerDropdown):
+    def _update_interaction_method(self, handle):
         """Update the UI based on the interaction method"""
-        hide_in_interactive = (not (dropdown.value == "Interactive")) # i.e., hide if in interactive mode
+        hide_in_interactive = (not (handle.value == "Click")) # i.e., hide if in interactive mode
 
-        self.cluster_scene.set_hidden((not hide_in_interactive))
+        self.cluster_scene_z.set_hidden((not hide_in_interactive))
         self.cluster_scene_scale.set_hidden((not hide_in_interactive))
-        self.cluster_scene_shuffle_colors.set_hidden((not hide_in_interactive))
+        self.z_cluster_scene_shuffle_colors.set_hidden((not hide_in_interactive))
 
         self.click_gaussian.set_hidden(hide_in_interactive)
         self.crop_to_click.set_hidden(hide_in_interactive)
         self.crop_to_group_level.set_hidden(hide_in_interactive)
-        self.move_current_crop.set_hidden(hide_in_interactive)
 
     def _reset_state(self, button: ViewerButton):
         """Revert to previous saved state"""
@@ -212,23 +205,19 @@ class DiGPipeline(VanillaPipeline):
         self.crop_to_click.set_disabled(True)
         self.crop_to_group_level.set_disabled(True)
         # self.crop_to_group_level.value = 0
-        self.move_current_crop.set_disabled(True)
         self.crop_group_list = []
-        if self.crop_transform_handle is not None:
-            self.crop_transform_handle.remove()
-            self.crop_transform_handle = None
         if len(self.state_stack) == 0:
-            self.reset_state.set_disabled(True)
+            self.d_reset_state.set_disabled(True)
 
         self.cluster_labels = None
-        self.cluster_scene.set_disabled(False)
+        self.cluster_scene_z.set_disabled(False)
 
     def _queue_state(self):
         """Save current state to stack"""
         import copy
         self.state_stack.append(copy.deepcopy({k:v.detach() for k,v in self.model.gauss_params.items()}))
-        if self.reset_state.gui_handle is not None:
-            self.reset_state.set_disabled(False)
+        if self.d_reset_state.gui_handle is not None:
+            self.d_reset_state.set_disabled(False)
 
     def _click_gaussian(self, button: ViewerButton):
         """Start listening for click-based 3D point specification.
@@ -428,7 +417,7 @@ class DiGPipeline(VanillaPipeline):
         """Reshuffle the cluster colors, if clusters defined using `_cluster_scene`."""
         if self.cluster_labels is None:
             return
-        self.cluster_scene_shuffle_colors.set_disabled(True)  # Disable user from reshuffling colors
+        self.z_cluster_scene_shuffle_colors.set_disabled(True)  # Disable user from reshuffling colors
         self.colormap = generate_random_colors()
         colormap = self.colormap
 
@@ -444,14 +433,14 @@ class DiGPipeline(VanillaPipeline):
 
         self.model.gauss_params['features_dc'] = torch.nn.Parameter(self.model.gauss_params['features_dc'])
         self.model.gauss_params['features_rest'] = torch.nn.Parameter(self.model.gauss_params['features_rest'])
-        self.cluster_scene_shuffle_colors.set_disabled(False)
+        self.z_cluster_scene_shuffle_colors.set_disabled(False)
 
     def _cluster_scene(self, button: ViewerButton):
         """Cluster the scene, and assign gaussian colors based on the clusters.
         Also populates self.crop_group_list with the clusters group indices."""
 
         self._queue_state()  # Save current state
-        self.cluster_scene.set_disabled(True)  # Disable user from clustering, while clustering
+        self.cluster_scene_z.set_disabled(True)  # Disable user from clustering, while clustering
 
         scale = self.cluster_scene_scale.value
         grouping_model = self.garfield_pipeline[0].model
@@ -471,7 +460,7 @@ class DiGPipeline(VanillaPipeline):
         min_bound = np.clip(pc_o3d.get_min_bound(), -1, 1)
         max_bound = np.clip(pc_o3d.get_max_bound(), -1, 1)
         # downsample size to be a percent of the bounding box extent
-        downsample_size = 0.01 * scale
+        downsample_size = 0.007 * scale
         pc, _, ids = pc_o3d.voxel_down_sample_and_trace(
             max(downsample_size, 0.0001), min_bound, max_bound
         )
@@ -481,7 +470,7 @@ class DiGPipeline(VanillaPipeline):
             print( "Are you sure you want to cluster? Press y to continue, else return.")
             # wait for input to continue, if yes then continue, else return
             if input() != "y":
-                self.cluster_scene.set_disabled(False)
+                self.cluster_scene_z.set_disabled(False)
                 return
 
         id_vec = np.array([points[0] for points in ids])  # indices of gaussians kept after downsampling
@@ -553,5 +542,7 @@ class DiGPipeline(VanillaPipeline):
         self.model.gauss_params['features_dc'] = torch.nn.Parameter(self.model.gauss_params['features_dc'])
         self.model.gauss_params['features_rest'] = torch.nn.Parameter(self.model.gauss_params['features_rest'])
 
-        self.cluster_scene.set_disabled(False)
+        self.cluster_scene_z.set_disabled(False)
         self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
+
+        self.save_state(None)

@@ -46,7 +46,7 @@ class DiGModel(SplatfactoModel):
         self.gauss_params['dino_feats'] = torch.nn.Parameter(torch.randn((self.num_points, self.config.gaussian_dim)))
         torch.inverse(torch.ones((1, 1), device="cuda:0"))# https://github.com/pytorch/pytorch/issues/90613
         self.viewer_control = ViewerControl()
-        self.click_gaussian = ViewerButton(name="Click Gaussian", cb_hook=self._click_gaussian)
+        self.zz_click_gaussian = ViewerButton(name="DINO Query Click", cb_hook=self._click_gaussian)
         self.click_location = None
         self.click_handle = None
         #convert to torch
@@ -76,10 +76,10 @@ class DiGModel(SplatfactoModel):
         Refer to garfield_interaction.py for more details."""
         def del_handle_on_rayclick(click: ViewerClick):
             self._on_rayclick(click)
-            self.click_gaussian.set_disabled(False)
+            self.zz_click_gaussian.set_disabled(False)
             self.viewer_control.unregister_click_cb(del_handle_on_rayclick)
 
-        self.click_gaussian.set_disabled(True)
+        self.zz_click_gaussian.set_disabled(True)
         self.viewer_control.register_click_cb(del_handle_on_rayclick)
 
     def _on_rayclick(self, click: ViewerClick):
