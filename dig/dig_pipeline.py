@@ -113,11 +113,15 @@ class DiGPipeline(VanillaPipeline):
             self.colormap = generate_random_colors()
 
             self.viewer_control = ViewerControl()
-
+            
+            self.num_clusters = ViewerNumber(name="Num. Clusters", default_value=0, disabled = True, visible=False)
+            
             self.a_segment_done_button = ViewerButtonGroup(name="Selection Type", cb_hook=self._update_interaction_method, default_value = 'Click',options=['Click','Cluster'])
             
 
             self.click_gaussian = ViewerButton(name="Click", cb_hook=self._click_gaussian)
+            self.last_two_clicks = []
+            
             self.click_location = None
             self.click_handle = None
 
@@ -137,7 +141,9 @@ class DiGPipeline(VanillaPipeline):
             save_state_dir.mkdir(parents=True, exist_ok=True)
             self.state_file = save_state_dir / "state.pt"
             self.load_button = ViewerButton("Load State", cb_hook=lambda _:self.load_state(), visible=True)
-    
+
+            self.combine_clusters_button = ViewerButton("Combine Last 2 Clicks", cb_hook=self._combine_last_two_clicks, visible=True, disabled=True)
+            
     @property
     def has_garfield(self):
         return 'garfield_pipeline' in self.__dict__
@@ -162,6 +168,10 @@ class DiGPipeline(VanillaPipeline):
         for name in self.model.gauss_params.keys():
             self.model.gauss_params[name] = loaded_state[name].clone().to(self.device)
         self.cluster_labels = loaded_state["cluster_labels"]
+        
+        if self.num_clusters.gui_handle is not None:
+            self.num_clusters.set_hidden(False)
+            self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
     
     def reset_colors(self):
         from cuml.neighbors import NearestNeighbors
@@ -264,7 +274,70 @@ class DiGPipeline(VanillaPipeline):
             mesh=sphere_mesh,
             position=VISER_NERFSTUDIO_SCALE_RATIO * self.click_location,
         )
+        
+        # Add clicked cluster to 'last_two_clicks' history if cluster labels are available
+        if self.cluster_labels is not None:
+            # get the closest 10 points to the sphere, using kdtree
+            ind = self._click_location_to_gauss_inds(10) 
+            # find most represented cluster
+            clicked_cluster = self.cluster_labels[list(ind)].to(torch.int).mode().values.item()
+            
+            # Check if this cluster was just clicked
+            if len(self.last_two_clicks) > 0 and clicked_cluster == self.last_two_clicks[-1]:
+                print(f"Cluster {clicked_cluster} was already clicked. Click a different cluster to combine.")
+                return
+                
+            self.last_two_clicks.append(clicked_cluster)
+            if len(self.last_two_clicks) > 2:
+                self.last_two_clicks.pop(0)
+            if len(self.last_two_clicks) == 2:
+                self.combine_clusters_button.set_disabled(False)
+    
+    def _combine_last_two_clicks(self, button: ViewerButton):
+        if len(self.last_two_clicks) == 2:
+            self._queue_state()
+            unique_labels = self.cluster_labels.unique().sort()[0]
+        
+            # Determine which label is larger (we'll map this one to the smaller one)
+            source_label = max(self.last_two_clicks[0], self.last_two_clicks[1])
+            target_label = min(self.last_two_clicks[0], self.last_two_clicks[1])
+            
+            # Combine the clusters
+            self.cluster_labels[self.cluster_labels == source_label] = target_label
+            
+            # Shift down all labels above the source_label by 1 to maintain consecutive labels
+            for label in unique_labels:
+                if label > source_label:
+                    self.cluster_labels[self.cluster_labels == label] -= 1
+            self.viewer_control.viewer._trigger_rerender()
+            
+            self.last_two_clicks = []
+            self.combine_clusters_button.set_disabled(True)
+            self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
+            self._reshuffle_cluster_colors(None)
+            self.save_state(None)
+        else:
+            print("Need to have two clicks in history to combine clusters.")
+            return
 
+    def _click_location_to_gauss_inds(self, top_k=10):
+        """Get the closest gaussians to the click location"""
+        curr_means = self.model.gauss_params['means'].detach()
+        self.model.eval()
+
+        # Get the 3D location of the click
+        location = self.click_location
+        location = torch.tensor(location).view(1, 3).to(self.device)
+
+        # Create a kdtree, to get the closest gaussian to the click-point.
+        points = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(curr_means.cpu().numpy()))
+        kdtree = o3d.geometry.KDTreeFlann(points)
+        _, inds, _ = kdtree.search_knn_vector_3d(location.view(3, -1).float().detach().cpu().numpy(), top_k)
+
+        # get the closest point to the sphere, using kdtree
+        return inds
+        
+        
     def _crop_to_click(self, button: ViewerButton):
         """Crop to click location"""
         assert self.click_location is not None, "Need to specify click location"
@@ -531,6 +604,10 @@ class DiGPipeline(VanillaPipeline):
         self.model.gauss_params['opacities'] = torch.nn.Parameter(opacities.float())
 
         self.cluster_labels = torch.Tensor(labels)
+        
+        self.num_clusters.set_hidden(False)
+        self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
+        
         features_dc = self.model.gauss_params['features_dc'].detach()
         features_rest = self.model.gauss_params['features_rest'].detach()
         for c_id in range(0, labels.max() + 1):
@@ -544,5 +621,6 @@ class DiGPipeline(VanillaPipeline):
 
         self.cluster_scene_z.set_disabled(False)
         self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
-
+        self.click_gaussian.set_disabled(False)
+        
         self.save_state(None)
