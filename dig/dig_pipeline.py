@@ -62,7 +62,7 @@ def generate_random_colors(N=5000) -> torch.Tensor:
 class DigPipelineConfig(VanillaPipelineConfig):
     """Gaussian Splatting, but also loading GARField grouping field from ckpt."""
     _target: Type = field(default_factory=lambda: DiGPipeline)
-    garfield_ckpt: Optional[Path] = None  # Need to specify this
+    garfield_ckpt: Optional[Path] = None  # Need to specify config.yml
 
 
 class DiGPipeline(VanillaPipeline):
@@ -134,15 +134,18 @@ class DiGPipeline(VanillaPipeline):
             self.z_cluster_scene_shuffle_colors = ViewerButton(name="Reshuffle Cluster Colors", cb_hook=self._reshuffle_cluster_colors, disabled=False, visible=False)
             self.cluster_labels = None
 
+            self.click_save_state_rigid = ViewerButton(name="Save Rigid-Body State", cb_hook=self._save_state_rigid, disabled=True, )
+            
             self.d_reset_state = ViewerButton(name="Undo", cb_hook=self._reset_state, disabled=True)
 
             dataset_name = config.datamanager.data.stem
             save_state_dir = Path(f"outputs/{dataset_name}")
             save_state_dir.mkdir(parents=True, exist_ok=True)
+            self.state_dir = save_state_dir
             self.state_file = save_state_dir / "state.pt"
             self.load_button = ViewerButton("Load State", cb_hook=lambda _:self.load_state(), visible=True)
 
-            self.combine_clusters_button = ViewerButton("Combine Last 2 Clicks", cb_hook=self._combine_last_two_clicks, visible=True, disabled=True)
+            self.combine_clusters_button = ViewerButton("Combine Last 2 Clicked Clusters", cb_hook=self._combine_last_two_clicks, visible=True, disabled=True)
             
     @property
     def has_garfield(self):
@@ -161,17 +164,72 @@ class DiGPipeline(VanillaPipeline):
 
         torch.save(params_to_save, self.state_file)
         print(f"State saved to {self.state_file}")
+        
+    def _save_state_rigid(self, button: ViewerButton):
+        from datetime import datetime
+        """Save the current state of the model."""
+        #save the current state
+        params_to_save = {}
+        for k, v in self.model.gauss_params.items():
+            params_to_save[k] = v  # assuming v is already a torch.Tensor
+        
+        pathlibstr = Path(f"state_rigid"+(datetime.now().strftime("_%Y%m%d_%H%M%S")+".pt"))
+        datetime_state_file = self.state_dir / pathlibstr
+        
+        # debug img
+        # image_file = self.state_dir / pathlibstr.with_suffix(".png")
+        # cam = self.viewer_control.get_camera(540, 960).to(self.device)
+        # output = self.model.get_outputs(cam)
+        # cv2.imwrite(str(image_file), cv2.cvtColor((output['rgb'].cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
+        torch.save(params_to_save, datetime_state_file)
+        print(f"State saved to {datetime_state_file}")
+        self.click_save_state_rigid.set_disabled(True)
+        
     def load_state(self):
-        self._queue_state()
-        loaded_state = torch.load(self.state_file)
-        for name in self.model.gauss_params.keys():
-            self.model.gauss_params[name] = loaded_state[name].clone().to(self.device)
-        self.cluster_labels = loaded_state["cluster_labels"]
+        # For now we only handle either multi-rigid or articulated body, not yet both
+        # If an articulated state.pt exists, that one gets loaded and none of the rigid states are loaded
+        rigid_state_files = list(self.state_dir.glob("state_rigid_*.pt"))
+        
+        if self.state_file.exists(): # Load articulated state and clusters from state.pt if it exists
+            self._queue_state()
+            loaded_state = torch.load(self.state_file)
+            for name in self.model.gauss_params.keys():
+                self.model.gauss_params[name] = loaded_state[name].clone().to(self.device)
+            self.cluster_labels = loaded_state["cluster_labels"]
+            
+            self.object_mode = 'articulated'
+            
+        elif len(rigid_state_files) > 0:
+            # Load rigid state multiple state files
+            self._queue_state()
+            params = {}
+            len_params = []
+            for state_file in rigid_state_files:
+                loaded_state = torch.load(state_file)
+                for name in self.model.gauss_params.keys():
+                    if name not in params:
+                        params[name] = []  # Initialize empty list for new keys
+                    if name not in loaded_state.keys():
+                        print(f"Warning: {name} not found in {state_file}, skipping.")
+                        continue
+                    params[name].append(loaded_state[name].clone().to(self.device))
+                len_params.append(len(loaded_state['means']))
+                
+            for name in self.model.gauss_params.keys():
+                params[name] = torch.cat(params[name], dim=0)
+                self.model.gauss_params[name] = params[name].clone().to(self.device)
+            self.cluster_labels = torch.cat([torch.full((length,), i, dtype=torch.float) for i, length in enumerate(len_params)])
+            
+            self.object_mode = 'rigid_obj'
+        else:
+            print(f"No state file found at {self.state_file} or in {self.state_dir}, unable to load state.")
+            return
         
         if self.num_clusters.gui_handle is not None:
             self.num_clusters.set_hidden(False)
             self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
+
     
     def reset_colors(self):
         from cuml.neighbors import NearestNeighbors
@@ -196,6 +254,8 @@ class DiGPipeline(VanillaPipeline):
 
         self.click_gaussian.set_hidden(hide_in_interactive)
         self.crop_to_click.set_hidden(hide_in_interactive)
+        self.combine_clusters_button.set_hidden(hide_in_interactive)
+        self.click_save_state_rigid.set_hidden(hide_in_interactive)
         self.crop_to_group_level.set_hidden(hide_in_interactive)
 
     def _reset_state(self, button: ViewerButton):
@@ -221,6 +281,7 @@ class DiGPipeline(VanillaPipeline):
 
         self.cluster_labels = None
         self.cluster_scene_z.set_disabled(False)
+        self.click_save_state_rigid.set_disabled(True)
 
     def _queue_state(self):
         """Save current state to stack"""
@@ -463,6 +524,7 @@ class DiGPipeline(VanillaPipeline):
         
         self.crop_group_list = keep_list
         self.crop_to_group_level.set_disabled(False)
+        self.click_save_state_rigid.set_disabled(False)
         self.crop_to_group_level.value = 29
 
     def _update_crop_vis(self, number: ViewerSlider):
@@ -485,6 +547,7 @@ class DiGPipeline(VanillaPipeline):
         prev_state = self.state_stack[-1]
         for name in self.model.gauss_params.keys():
             self.model.gauss_params[name] = prev_state[name][keep_inds]
+        self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
 
     def _reshuffle_cluster_colors(self, button: ViewerButton):
         """Reshuffle the cluster colors, if clusters defined using `_cluster_scene`."""
