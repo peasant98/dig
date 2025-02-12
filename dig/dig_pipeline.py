@@ -18,11 +18,12 @@ from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
 from nerfstudio.models.splatfacto import SplatfactoModel
 
 from cuml.cluster.hdbscan import HDBSCAN
-from nerfstudio.models.splatfacto import RGB2SH
+from nerfstudio.models.splatfacto import RGB2SH, SH2RGB
 
 import tqdm
 
 from sklearn.neighbors import NearestNeighbors
+from enum import Enum, auto
 
 from garfield.garfield_datamanager import GarfieldDataManagerConfig, GarfieldDataManager
 from garfield.garfield_model import GarfieldModel, GarfieldModelConfig
@@ -57,12 +58,16 @@ def generate_random_colors(N=5000) -> torch.Tensor:
     rgb = cv2.cvtColor((hsv * 255).astype(np.uint8)[None, ...], cv2.COLOR_HSV2RGB)
     return torch.Tensor(rgb.squeeze() / 255.0)
 
+class ObjectMode(Enum):
+    ARTICULATED = auto()
+    RIGID_OBJECTS = auto()
 
 @dataclass
 class DigPipelineConfig(VanillaPipelineConfig):
     """Gaussian Splatting, but also loading GARField grouping field from ckpt."""
     _target: Type = field(default_factory=lambda: DiGPipeline)
     garfield_ckpt: Optional[Path] = None  # Need to specify config.yml
+    filter_table_plane: Optional[bool] = True
 
 
 class DiGPipeline(VanillaPipeline):
@@ -190,22 +195,23 @@ class DiGPipeline(VanillaPipeline):
         # For now we only handle either multi-rigid or articulated body, not yet both
         # If an articulated state.pt exists, that one gets loaded and none of the rigid states are loaded
         rigid_state_files = list(self.state_dir.glob("state_rigid_*.pt"))
-        
+        self.fixed_obj_ids = []
         if self.state_file.exists(): # Load articulated state and clusters from state.pt if it exists
             self._queue_state()
             loaded_state = torch.load(self.state_file)
             for name in self.model.gauss_params.keys():
                 self.model.gauss_params[name] = loaded_state[name].clone().to(self.device)
             self.cluster_labels = loaded_state["cluster_labels"]
+            self.model.cluster_labels = self.cluster_labels.to(self.device)
             
-            self.object_mode = 'articulated'
+            self.object_mode = ObjectMode.ARTICULATED
             
         elif len(rigid_state_files) > 0:
             # Load rigid state multiple state files
             self._queue_state()
             params = {}
             len_params = []
-            for state_file in rigid_state_files:
+            for idx, state_file in enumerate(rigid_state_files):
                 loaded_state = torch.load(state_file)
                 for name in self.model.gauss_params.keys():
                     if name not in params:
@@ -216,12 +222,17 @@ class DiGPipeline(VanillaPipeline):
                     params[name].append(loaded_state[name].clone().to(self.device))
                 len_params.append(len(loaded_state['means']))
                 
+                # Check if fixed is in the name of the file, in which case we store info about fixed masks (for turning off certain tracking features on this object)
+                if 'fixed' in state_file.name:
+                    self.fixed_obj_ids.append(idx)
+                
             for name in self.model.gauss_params.keys():
                 params[name] = torch.cat(params[name], dim=0)
                 self.model.gauss_params[name] = params[name].clone().to(self.device)
             self.cluster_labels = torch.cat([torch.full((length,), i, dtype=torch.float) for i, length in enumerate(len_params)])
+            self.model.cluster_labels = self.cluster_labels.to(self.device)
             
-            self.object_mode = 'rigid_obj'
+            self.object_mode = ObjectMode.RIGID_OBJECTS
         else:
             print(f"No state file found at {self.state_file} or in {self.state_dir}, unable to load state.")
             return
@@ -398,6 +409,43 @@ class DiGPipeline(VanillaPipeline):
         # get the closest point to the sphere, using kdtree
         return inds
         
+    def _estimate_table_plane(self, means):
+        points = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means.cpu().numpy()))
+        # First segment the plane
+        plane_model, inliers = points.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
+        [a, b, c, d] = plane_model
+
+        # Convert plane normal to unit vector
+        normal = np.array([a, b, c])
+        normal = normal / np.linalg.norm(normal)
+
+        # Check if plane normal is roughly aligned with Z axis
+        z_axis = np.array([0, 0, 1])
+        # Check both upward and downward facing normals
+        dot_product = max(np.abs(np.dot(normal, z_axis)), np.abs(np.dot(-normal, z_axis)))
+        if dot_product < 0.7:  # cos(45 degrees) ≈ 0.707
+            print("Warning: Detected plane is not horizontal")
+            return None
+        if np.abs(np.dot(normal, z_axis)) < -0.7:
+            normal = -normal
+        
+        # Calculate signed distances from all points to the plane
+        points_np = np.asarray(points.points)
+        signed_dists = (points_np @ normal + d) / np.linalg.norm(normal)
+
+        # Points above the plane have positive distance, below have negative
+        above_mask = signed_dists > 0.01  # Small threshold to avoid numerical issues
+        below_mask = signed_dists < -0.01
+
+        # Convert to tensor indices
+        above_indices = torch.from_numpy(np.where(above_mask)[0])
+        below_indices = torch.from_numpy(np.where(below_mask)[0])
+
+        return {
+            'above': above_indices,
+            'below': below_indices,
+            'plane_model': plane_model
+        }
         
     def _crop_to_click(self, button: ViewerButton):
         """Crop to click location"""
@@ -405,8 +453,28 @@ class DiGPipeline(VanillaPipeline):
 
         self._queue_state()  # Save current state
         curr_means = self.model.gauss_params['means'].detach()
+        # curr_dcsh = self.model.gauss_params['features_dc'].detach()
+        # curr_rgb = SH2RGB(curr_dcsh)
         self.model.eval()
-
+        
+        plane_out = self._estimate_table_plane(curr_means)
+        # server2 = viser.ViserServer()
+        # server2.scene.add_point_cloud(
+        #     name='/above_points',
+        #     points=curr_means[out['above']].cpu().detach().numpy(),
+        #     colors=curr_rgb[out['above']].cpu().detach().numpy(),
+        #     point_size=0.005,
+        #     point_shape='circle'
+        # )
+        # server2.scene.add_point_cloud(
+        #     name='/below_points',
+        #     points=curr_means[out['below']].cpu().detach().numpy(),
+        #     colors=curr_rgb[out['below']].cpu().detach().numpy(),
+        #     point_size=0.005,
+        #     point_shape='circle'
+            
+        # )
+        # import pdb ; pdb.set_trace()
         # The only way to reset is to reset the state using the reset button.
         self.click_gaussian.set_disabled(True)  # Disable user from changing click
         self.crop_to_click.set_disabled(True)  # Disable user from changing click
@@ -425,7 +493,7 @@ class DiGPipeline(VanillaPipeline):
 
         # get the closest point to the sphere, using kdtree
         sphere_inds = inds
-        scales = torch.ones((positions.shape[0], 1)).to(self.device)
+        # scales = torch.ones((positions.shape[0], 1)).to(self.device)
 
         keep_list = []
         prev_group = None
@@ -440,6 +508,10 @@ class DiGPipeline(VanillaPipeline):
 
             # Filter out points that have affinity < 0.5 (i.e., not likely to be in the same group)
             keeps = torch.where(affinity < 0.5)[0].cpu()
+            if self.config.filter_table_plane and plane_out is not None:
+                # Filter out points that are above the table plane
+                # Get indices that are in both keeps and above_plane using intersection
+                keeps = keeps[torch.isin(keeps, plane_out['above'])]
             keep_points = points.select_by_index(keeps.tolist())  # indices of gaussians
 
             # Here, we desire the gaussian groups to be grouped tightly together spatially. 

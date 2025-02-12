@@ -23,7 +23,7 @@ dig_method = MethodSpecification(
         method_name="dig",
         steps_per_eval_batch=500,
         steps_per_save=2000,
-        max_num_iterations=8000,
+        max_num_iterations=10000,
         mixed_precision=False,
         pipeline=DigPipelineConfig(#use this for overlaying dino on top of a garfield trained model
             datamanager=DiGDataManagerConfig(
@@ -78,7 +78,13 @@ dig_method = MethodSpecification(
             "scheduler": ExponentialDecaySchedulerConfig(
                 lr_final=5e-6, max_steps=6000, warmup_steps=700
             ),
-        },
+            },
+            "bilateral_grid": {
+            "optimizer": AdamOptimizerConfig(lr=2e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=1e-4, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+            ),
+            },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",

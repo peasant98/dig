@@ -2,21 +2,15 @@ from dataclasses import field
 from typing import Dict, List, Type,Literal
 
 from torch.nn import Parameter
-# from gsplat.sh import spherical_harmonics
 
 from nerfstudio.viewer.viewer_elements import *
 from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
-# from gsplat.project_gaussians import project_gaussians
-# from gsplat.rasterize import rasterize_gaussians
 from gsplat.rendering import rasterization
-import math
 from nerfstudio.model_components import renderers
 from nerfstudio.viewer.viewer_elements import *
 from dig.data.utils.dino_dataloader import get_img_resolution,MAX_DINO_SIZE
 from torchvision.transforms.functional import resize
-import tinycudann as tcnn
-import contextlib
-from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 
 from collections import OrderedDict
 import torch
@@ -37,7 +31,9 @@ class DiGModelConfig(SplatfactoModelConfig):
     gaussian_dim: int = 64
     """Dimension the gaussians actually store as features"""
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
-
+    use_bilateral_grid: bool = False
+    """If True, use bilateral grid to handle the ISP changes in the image space. This technique was introduced in the paper 'Bilateral Guided Radiance Field Processing' (https://bilarfpro.github.io/)."""
+    
 class DiGModel(SplatfactoModel):
     config: DiGModelConfig
 
@@ -49,6 +45,7 @@ class DiGModel(SplatfactoModel):
         self.zz_click_gaussian = ViewerButton(name="DINO Query Click", cb_hook=self._click_gaussian)
         self.click_location = None
         self.click_handle = None
+        self.cluster_labels = None
         #convert to torch
         self.nn = torch.nn.Sequential(
             torch.nn.Linear(self.config.gaussian_dim, 64, bias = False),
@@ -128,7 +125,7 @@ class DiGModel(SplatfactoModel):
         gps['nn_projection'] = list(self.nn.parameters())
         return gps
 
-    def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
+    def get_outputs(self, camera: Cameras, obj_id: int = None, invert_crop: bool = False, rgb_only: bool = False) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a Ray Bundle and returns a dictionary of outputs.
 
         Args:
@@ -175,6 +172,13 @@ class DiGModel(SplatfactoModel):
         viewmat = get_viewmat(optimized_camera_to_world)
         W, H = int(camera.width[0] * camera_scale_fac), int(camera.height[0] * camera_scale_fac)
         self.last_size = (H, W)
+        
+        if obj_id is not None:
+            assert self.cluster_labels is not None
+            if invert_crop:
+                crop_ids = torch.where(self.cluster_labels != obj_id)[0]
+            else:
+                crop_ids = torch.where(self.cluster_labels == obj_id)[0]
 
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
@@ -212,7 +216,7 @@ class DiGModel(SplatfactoModel):
 
         render, alpha, info = rasterization(
             means=means_crop,
-            quats=F.normalize(quats_crop,dim=1),
+            quats=quats_crop,
             scales=torch.exp(scales_crop),
             opacities=torch.sigmoid(opacities_crop).squeeze(-1),
             colors=colors_crop,
@@ -247,6 +251,9 @@ class DiGModel(SplatfactoModel):
         else:
             depth_im = None
         out = {"rgb": rgb.squeeze(0), "depth": depth_im, "accumulation": alpha.squeeze(0), "background": background}
+        
+        if rgb_only:
+            return out
         # Insert DINO stuff
         p_size = 14
         downscale = 1.0 if not self.training else (self.config.dino_rescale_factor*MAX_DINO_SIZE/max(H,W))/p_size
@@ -259,7 +266,7 @@ class DiGModel(SplatfactoModel):
             dino_h,dino_w = H,W
         dino_feats, dino_alpha, _ = rasterization(
             means=means_crop.detach() if self.training else means_crop,
-            quats=F.normalize(quats_crop,dim=1).detach(),
+            quats=quats_crop.detach(),
             scales=torch.exp(scales_crop).detach(),
             opacities=torch.sigmoid(opacities_crop).squeeze(-1).detach(),
             colors=dino_crop,
@@ -282,7 +289,7 @@ class DiGModel(SplatfactoModel):
         nn_inputs = dino_feats.view(-1,self.config.gaussian_dim)
         dino_feats = self.nn(nn_inputs).view(*feat_shape[:-1],-1)
         if not self.training:
-            dino_feats[dino_alpha.squeeze(-1) < 0.8] = 0
+            dino_feats[dino_alpha.squeeze(-1) < 0.9] = 0
         out |= {"dino":dino_feats.squeeze(0),'dino_alpha':dino_alpha.squeeze(0)}  # type: ignore
         if hasattr(self,'click_feat') and not self.training:
             #compute similarity to click_feat across dino feats
