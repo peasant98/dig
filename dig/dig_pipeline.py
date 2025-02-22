@@ -1,6 +1,6 @@
 import typing
 from dataclasses import dataclass, field
-from typing import Literal, Type, Mapping, Any, Optional, List, Dict
+from typing import Literal, Type, Mapping, Any, Optional, List, Dict, TypedDict
 from torchtyping import TensorType
 from pathlib import Path
 import trimesh
@@ -16,6 +16,7 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from nerfstudio.viewer.viewer_elements import *
 from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
 from nerfstudio.models.splatfacto import SplatfactoModel
+from collections import OrderedDict
 
 from cuml.cluster.hdbscan import HDBSCAN
 from nerfstudio.models.splatfacto import RGB2SH, SH2RGB
@@ -24,6 +25,17 @@ import tqdm
 
 from sklearn.neighbors import NearestNeighbors
 from enum import Enum, auto
+
+from PIL import Image
+from dig.exporter.exporter_utils import *
+from dig.exporter.tsdf_utils import export_tsdf_mesh
+from dig.scripts.exporter import ExportGaussianSplat, matrix_to_quaternion
+import os
+import json
+from nerfstudio.utils.io import load_from_json
+import numpy.typing as onpt
+import numpy as onp
+from plyfile import PlyData
 
 from garfield.garfield_datamanager import GarfieldDataManagerConfig, GarfieldDataManager
 from garfield.garfield_model import GarfieldModel, GarfieldModelConfig
@@ -67,8 +79,9 @@ class DigPipelineConfig(VanillaPipelineConfig):
     """Gaussian Splatting, but also loading GARField grouping field from ckpt."""
     _target: Type = field(default_factory=lambda: DiGPipeline)
     garfield_ckpt: Optional[Path] = None  # Need to specify config.yml
-    filter_table_plane: Optional[bool] = True
-
+    filter_table_plane: Optional[bool] = False
+    rescale_mesh_to_world: Optional[bool] = True
+    garfield_scales: int = 40
 
 class DiGPipeline(VanillaPipeline):
     """
@@ -131,7 +144,7 @@ class DiGPipeline(VanillaPipeline):
             self.click_handle = None
 
             self.crop_to_click = ViewerButton(name="Crop to Click", cb_hook=self._crop_to_click, disabled=True)
-            self.crop_to_group_level = ViewerSlider(name="Group Level", min_value=0, max_value=29, step=1, default_value=0, cb_hook=self._update_crop_vis, disabled=True)
+            self.crop_to_group_level = ViewerSlider(name="Group Level", min_value=0, max_value=self.config.garfield_scales-1, step=1, default_value=0, cb_hook=self._update_crop_vis, disabled=True)
             self.crop_group_list = []
 
             self.cluster_scene_z = ViewerButton(name="Cluster Scene", cb_hook=self._cluster_scene, disabled=False, visible=False)
@@ -152,6 +165,37 @@ class DiGPipeline(VanillaPipeline):
 
             self.combine_clusters_button = ViewerButton("Combine Last 2 Clicked Clusters", cb_hook=self._combine_last_two_clicks, visible=True, disabled=True)
             
+            #temporary ns-viewer load-config mesh devel 
+            # self.load_state()
+            # if self.cluster_labels is None:
+            #     time.sleep(1)
+            # self.model.training = False
+            # export_tsdf_mesh(self, output_dir = self.state_dir)
+            # import pdb; pdb.set_trace()
+            
+            # dataparser_outputs = self.datamanager.train_dataset._dataparser_outputs
+            # cameras = dataparser_outputs.cameras # Without distortion?
+            # rgb, depth, foreground_mask, img_paths = render_trajectory(self, cameras, 'rgb', 'depth', return_rgba_images=True)
+            # os.makedirs(os.path.join(self.state_dir, f"masks"), exist_ok=True)
+            # for idx, mask in enumerate(foreground_mask):
+            #     mask = Image.fromarray((mask * 255).astype(np.uint8))
+            #     mask.save(os.path.join(self.state_dir, f"masks", f"{img_paths[idx].stem}.jpg.png"))
+            
+            # os.makedirs(os.path.join(self.state_dir, f"rgba"), exist_ok=True)
+            # for idx, img in enumerate(rgb):
+            #     img = Image.fromarray((img * 255).astype(np.uint8))
+            #     img.save(os.path.join(self.state_dir, f"rgba", f"{img_paths[idx].stem}.png"))
+            
+            # self.mesh_debug_viser = True
+            # if self.mesh_debug_viser:
+            #     import viser
+            #     self.server = viser.ViserServer()
+            
+            # self.write_state_to_ply()
+            # self.convert_cameras()
+            # import pdb; pdb.set_trace()
+            
+            
     @property
     def has_garfield(self):
         return 'garfield_pipeline' in self.__dict__
@@ -169,6 +213,9 @@ class DiGPipeline(VanillaPipeline):
 
         torch.save(params_to_save, self.state_file)
         print(f"State saved to {self.state_file}")
+        self.write_state_to_ply()
+        self.save_rendered_images()
+        self.convert_cameras()
         
     def _save_state_rigid(self, button: ViewerButton):
         from datetime import datetime
@@ -182,19 +229,32 @@ class DiGPipeline(VanillaPipeline):
         datetime_state_file = self.state_dir / pathlibstr
         
         # debug img
-        # image_file = self.state_dir / pathlibstr.with_suffix(".png")
-        # cam = self.viewer_control.get_camera(540, 960).to(self.device)
-        # output = self.model.get_outputs(cam)
-        # cv2.imwrite(str(image_file), cv2.cvtColor((output['rgb'].cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
         torch.save(params_to_save, datetime_state_file)
         print(f"State saved to {datetime_state_file}")
+        
+        os.makedirs(os.path.join(self.state_dir, str(pathlibstr.with_suffix(""))), exist_ok=True)
+        
+        self.write_state_to_ply(dir_name = str(pathlibstr.with_suffix("")))
+        self.save_rendered_images(dir_name = str(pathlibstr.with_suffix("")))
+        self.convert_cameras(dir_name = str(pathlibstr.with_suffix("")))
+        # export_tsdf_mesh(self, output_dir = self.state_dir / pathlibstr.with_suffix("")) # Poor quality mesh, use SuGaR pipeline instead
         self.click_save_state_rigid.set_disabled(True)
         
-    def load_state(self):
+    def load_state(self, state_path_filename: str | list[str] = None):
         # For now we only handle either multi-rigid or articulated body, not yet both
         # If an articulated state.pt exists, that one gets loaded and none of the rigid states are loaded
-        rigid_state_files = list(self.state_dir.glob("state_rigid_*.pt"))
+        if state_path_filename is not None: # Manual state file specification
+            if isinstance(state_path_filename, str):
+                self.state_file = Path(state_path_filename)
+            elif isinstance(state_path_filename, list):
+                rigid_state_files = state_path_filename
+                for state_file in rigid_state_files:
+                    assert Path(state_file).exists(), f"Provided state file path {state_file} does not exist."
+        else:
+            rigid_state_files = sorted(self.state_dir.glob("state_rigid_*.pt"), key=lambda x: x.stem.split('_')[3])  # Extract timestamp from filename
+            # Assumes objects were clustered on the same day haha...
+        
         self.fixed_obj_ids = []
         if self.state_file.exists(): # Load articulated state and clusters from state.pt if it exists
             self._queue_state()
@@ -230,7 +290,7 @@ class DiGPipeline(VanillaPipeline):
                 params[name] = torch.cat(params[name], dim=0)
                 self.model.gauss_params[name] = params[name].clone().to(self.device)
             self.cluster_labels = torch.cat([torch.full((length,), i, dtype=torch.float) for i, length in enumerate(len_params)])
-            self.model.cluster_labels = self.cluster_labels.to(self.device)
+            self.model.cluster_labels = self.cluster_labels.to(self.device).int()
             
             self.object_mode = ObjectMode.RIGID_OBJECTS
         else:
@@ -424,7 +484,7 @@ class DiGPipeline(VanillaPipeline):
         # Check both upward and downward facing normals
         dot_product = max(np.abs(np.dot(normal, z_axis)), np.abs(np.dot(-normal, z_axis)))
         if dot_product < 0.7:  # cos(45 degrees) ≈ 0.707
-            print("Warning: Detected plane is not horizontal")
+            print("Warning: Detected plane is not horizontal, not setting plane")
             return None
         if np.abs(np.dot(normal, z_axis)) < -0.7:
             normal = -normal
@@ -457,7 +517,10 @@ class DiGPipeline(VanillaPipeline):
         # curr_rgb = SH2RGB(curr_dcsh)
         self.model.eval()
         
-        plane_out = self._estimate_table_plane(curr_means)
+        if self.config.filter_table_plane:
+            plane_out = self._estimate_table_plane(curr_means)
+        else:
+            plane_out = None
         # server2 = viser.ViserServer()
         # server2.scene.add_point_cloud(
         #     name='/above_points',
@@ -500,20 +563,51 @@ class DiGPipeline(VanillaPipeline):
 
         # Iterate over different scales, to get the a range of possible groupings.
         grouping_model = self.garfield_pipeline[0].model
-        for s in tqdm.tqdm(torch.linspace(0, 1.5, 30)):
+        for s in tqdm.tqdm(torch.linspace(0, 1.5, self.config.garfield_scales)):
             # Calculate the grouping features, and calculate the affinity between click point and scene
             instances = grouping_model.get_grouping_at_points(positions, s)  # (1+N, 256)
             click_instance = instances[0]
             affinity = torch.norm(click_instance - instances, dim=1)[1:]
 
+            all_indices = torch.arange(len(affinity), device=affinity.device)
+            final_mask = torch.ones_like(all_indices, dtype=torch.bool)
+    
             # Filter out points that have affinity < 0.5 (i.e., not likely to be in the same group)
-            keeps = torch.where(affinity < 0.5)[0].cpu()
+            # keeps = torch.where(affinity < 0.5)[0].cpu()
+            affinity_mask = affinity < 0.5
+            final_mask &= affinity_mask
             if self.config.filter_table_plane and plane_out is not None:
                 # Filter out points that are above the table plane
                 # Get indices that are in both keeps and above_plane using intersection
-                keeps = keeps[torch.isin(keeps, plane_out['above'])]
-            keep_points = points.select_by_index(keeps.tolist())  # indices of gaussians
+                plane_mask = torch.zeros_like(final_mask, dtype=torch.bool)
+                plane_mask[plane_out['above']] = True
+                final_mask &= plane_mask
 
+            keeps = all_indices[final_mask].cpu()
+            keep_points = points.select_by_index(keeps.tolist())
+
+            # Apply opacity and scale filtering on the kept points
+            # opacities = self.model.gauss_params["opacities"].detach().cpu()
+            # scales = self.model.gauss_params["scales"].detach().cpu()
+
+            # # Create masks for the already filtered points
+            # kept_opacities = opacities[keeps]
+            # kept_scales = scales[keeps]
+
+            # opacity_threshold = kept_opacities.mean() - torch.tensor(np.log(2.5))
+            # scale_threshold = kept_scales.mean() + torch.tensor(np.log(2.0))
+
+            # # Create masks for the filtered subset (already on CPU)
+            # opacity_mask = (kept_opacities > opacity_threshold).squeeze()
+            # scale_mask = kept_scales < scale_threshold
+            # scale_mask = scale_mask.any(axis=1)  # Combine the 3 dimensions
+
+            # # Apply both masks to the keeps indices (all on CPU now)
+            # keeps = keeps[opacity_mask & scale_mask]
+
+            # # Update keep_points for DBSCAN
+            # keep_points = points.select_by_index(keeps.tolist())
+        
             # Here, we desire the gaussian groups to be grouped tightly together spatially. 
             # We use DBSCAN to group the gaussians together, and choose the cluster that contains the click point.
             # Note that there may be spuriously high affinity between points that are spatially far apart,
@@ -533,7 +627,7 @@ class DiGPipeline(VanillaPipeline):
                 )
 
                 if len(curr_points_ds_ids) == keeps.shape[0]:
-                    clusters = np.asarray(keep_points.cluster_dbscan(eps=0.02, min_points=5))
+                    clusters = np.asarray(keep_points.cluster_dbscan(eps=0.1, min_points=3)) # Used to be 0.02 and 5
                 
                 else:
                     curr_points_ds_ids = np.array([points[0] for points in curr_points_ds_ids])
@@ -541,7 +635,7 @@ class DiGPipeline(VanillaPipeline):
                     curr_points_ds_selected = np.zeros(len(keep_points.points), dtype=bool)
                     curr_points_ds_selected[curr_points_ds_ids] = True
 
-                    _clusters = np.asarray(curr_points_ds.cluster_dbscan(eps=0.02, min_points=5))
+                    _clusters = np.asarray(curr_points_ds.cluster_dbscan(eps=0.05, min_points=3))
                     nn_model = NearestNeighbors(
                         n_neighbors=1, algorithm="auto", metric="euclidean"
                     ).fit(np.asarray(curr_points_ds.points))
@@ -557,7 +651,10 @@ class DiGPipeline(VanillaPipeline):
                     clusters[~curr_points_ds_selected] = _clusters[indices[:, 0]]
 
             else:
-                clusters = np.asarray(keep_points.cluster_dbscan(eps=0.02, min_points=5))
+                clusters = np.asarray(keep_points.cluster_dbscan(eps=0.05, min_points=5))
+            # import pdb; pdb.set_trace()
+            # clusters = np.asarray(keep_points)
+            
 
             # Choose the cluster that contains the click point. If there is none, move to the next scale.
             cluster_inds = clusters[np.isin(keeps, sphere_inds)]
@@ -597,7 +694,7 @@ class DiGPipeline(VanillaPipeline):
         self.crop_group_list = keep_list
         self.crop_to_group_level.set_disabled(False)
         self.click_save_state_rigid.set_disabled(False)
-        self.crop_to_group_level.value = 29
+        self.crop_to_group_level.value = self.config.garfield_scales - 1
 
     def _update_crop_vis(self, number: ViewerSlider):
         """Update which click-based crop to visualize -- this requires that _crop_to_click has been called."""
@@ -759,3 +856,318 @@ class DiGPipeline(VanillaPipeline):
         self.click_gaussian.set_disabled(False)
         
         self.save_state(None)
+        
+        
+    def write_state_to_ply(self, dir_name: str = None, file_name: str = "point_cloud.ply"):
+        if dir_name is not None:
+            out_file = self.state_dir / dir_name / file_name
+        else:
+            out_file = self.state_dir / file_name
+            
+        ply_color_mode: Literal["sh_coeffs", "rgb"] = "sh_coeffs"
+        map_to_tensors = OrderedDict()
+        
+        # init_means = self.model.gauss_params['means'].detach().clone()
+        # labels = self.cluster_labels.int().cuda()
+        # num_groups, group_masks, init_p2o = configure_from_clusters(init_means, labels)
+
+        with torch.no_grad():
+            positions = self.model.means.cpu().numpy()
+            count = positions.shape[0]
+            n = count
+            map_to_tensors["x"] = positions[:, 0]
+            map_to_tensors["y"] = positions[:, 1]
+            map_to_tensors["z"] = positions[:, 2]
+            map_to_tensors["nx"] = np.zeros(n, dtype=np.float32)
+            map_to_tensors["ny"] = np.zeros(n, dtype=np.float32)
+            map_to_tensors["nz"] = np.zeros(n, dtype=np.float32)
+
+            if ply_color_mode == "rgb":
+                colors = torch.clamp(self.model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
+                colors = (colors * 255).astype(np.uint8)
+                map_to_tensors["red"] = colors[:, 0]
+                map_to_tensors["green"] = colors[:, 1]
+                map_to_tensors["blue"] = colors[:, 2]
+            elif ply_color_mode == "sh_coeffs":
+                shs_0 = self.model.shs_0.contiguous().cpu().numpy()
+                for i in range(shs_0.shape[1]):
+                    map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
+
+            if self.model.config.sh_degree > 0:
+                if ply_color_mode == "rgb":
+                    CONSOLE.print(
+                        "Warning: model has higher level of spherical harmonics, ignoring them and only export rgb."
+                    )
+                elif ply_color_mode == "sh_coeffs":
+                    # transpose(1, 2) was needed to match the sh order in Inria version
+                    shs_rest = self.model.shs_rest.transpose(1, 2).contiguous().cpu().numpy()
+                    shs_rest = shs_rest.reshape((n, -1))
+                    for i in range(shs_rest.shape[-1]):
+                        map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
+
+            map_to_tensors["opacity"] = self.model.opacities.data.cpu().numpy()
+
+            scales = self.model.scales.data.cpu().numpy()
+            for i in range(3):
+                map_to_tensors[f"scale_{i}"] = scales[:, i, None]
+
+            quats = self.model.quats.data.cpu().numpy()
+            for i in range(4):
+                map_to_tensors[f"rot_{i}"] = quats[:, i, None]
+
+            if self.config.rescale_mesh_to_world:
+                # apply the inverse dataparser transform to the point cloud
+                filtered_position = np.concatenate([map_to_tensors["x"][:, None], map_to_tensors["y"][:, None], map_to_tensors["z"][:, None]], axis=1)
+                filtered_quats = np.concatenate([map_to_tensors[f"rot_{i}"][:, None] for i in range(4)], axis=1).squeeze(axis=-1)
+                
+                points = np.zeros((filtered_position.shape[0],3,4))
+                points[:,:3,3] = filtered_position[:,:3]
+                
+                points[:,:3,:3] = quat_to_rotmat(torch.from_numpy(filtered_quats)).numpy()
+                
+                poses = np.eye(4, dtype=np.float32)[None, ...].repeat(points.shape[0], axis=0)[:, :3, :]
+                poses[:, :3, :] = points
+
+                homogeneous_row = np.array([0, 0, 0, 1]).reshape(1, 4)
+                newposes = poses
+                homogeneous_row = np.tile(homogeneous_row, (newposes.shape[0], 1, 1))  # Repeat for each pose
+                poses_homogeneous = np.concatenate([newposes, homogeneous_row], axis=1)
+
+                tf_mat = np.eye(4)
+                tf_mat[:3,] = self.datamanager.train_dataparser_outputs.dataparser_transform
+                poses_homogeneous[:, :3, 3] = poses_homogeneous[:, :3, 3] / np.array(self.datamanager.train_dataparser_outputs.dataparser_scale)
+                
+                poses_homogeneous = np.linalg.inv(tf_mat) @ poses_homogeneous
+                poses_homogeneous = torch.from_numpy(poses_homogeneous)
+
+                for i in range(3):
+                    map_to_tensors[f"scale_{i}"] = scales[:, i] - np.log(self.datamanager.train_dataparser_outputs.dataparser_scale)
+
+                xyz = poses_homogeneous[:, :3, 3]
+                rot = poses_homogeneous[:, :3, :3]
+                quat = matrix_to_quaternion(rot)
+                map_to_tensors["x"] = xyz[:, 0].numpy()
+                map_to_tensors["y"] = xyz[:, 1].numpy()
+                map_to_tensors["z"] = xyz[:, 2].numpy()
+                for qi in range(4):
+                    map_to_tensors[f"rot_{qi}"] = quat[:, qi, None].numpy()
+            
+        # post optimization, it is possible have NaN/Inf values in some attributes
+        # to ensure the exported ply file has finite values, we enforce finite filters.
+        select = np.ones(n, dtype=bool)
+        for k, t in map_to_tensors.items():
+            n_before = np.sum(select)
+            select = np.logical_and(select, np.isfinite(t).all(axis=-1))
+            n_after = np.sum(select)
+            if n_after < n_before:
+                CONSOLE.print(f"{n_before - n_after} NaN/Inf elements in {k}")
+        nan_count = np.sum(select) - n
+
+        low_opacity_gaussians = (map_to_tensors["opacity"]).squeeze(axis=-1) < -5.5373  # logit(1/255)
+        
+        lowopa_count = np.sum(low_opacity_gaussians)
+        select[low_opacity_gaussians] = 0
+
+        if np.sum(select) < n:
+            CONSOLE.print(
+                f"{nan_count} Gaussians have NaN/Inf and {lowopa_count} have low opacity, only export {np.sum(select)}/{n}"
+            )
+            for k, t in map_to_tensors.items():
+                map_to_tensors[k] = map_to_tensors[k][select]
+            count = np.sum(select)
+            
+
+        ExportGaussianSplat.write_ply(str(out_file), count, map_to_tensors)
+        
+
+        splat_data = self.load_ply_file(out_file, center=False)
+        if hasattr(self, 'server'):
+            gs_handle = self.server.scene._add_gaussian_splats(
+                f"/gaussian_splat",
+                centers=splat_data["centers"],
+                rgbs=splat_data["rgbs"],
+                opacities=splat_data["opacities"],
+                covariances=splat_data["covariances"],
+            )
+
+    
+    class SplatFile(TypedDict):
+        """Data loaded from an antimatter15-style splat file."""
+
+        centers: onpt.NDArray[onp.floating]
+        """(N, 3)."""
+        rgbs: onpt.NDArray[onp.floating]
+        """(N, 3). Range [0, 1]."""
+        opacities: onpt.NDArray[onp.floating]
+        """(N, 1). Range [0, 1]."""
+        covariances: onpt.NDArray[onp.floating]
+        """(N, 3, 3)."""
+
+    def load_ply_file(self, ply_file_path: Path, center: bool = False) -> SplatFile:
+        """Load Gaussians stored in a PLY file."""
+        start_time = time.time()
+
+        SH_C0 = 0.28209479177387814
+
+        plydata = PlyData.read(ply_file_path)
+        v = plydata["vertex"]
+        positions = onp.stack([v["x"], v["y"], v["z"]], axis=-1)
+        scales = onp.exp(onp.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1))
+        wxyzs = onp.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=1)
+        colors = 0.5 + SH_C0 * onp.stack([v["f_dc_0"], v["f_dc_1"], v["f_dc_2"]], axis=1)
+        opacities = 1.0 / (1.0 + onp.exp(-v["opacity"][:, None]))
+
+        Rs = vtf.SO3(wxyzs).as_matrix()
+        covariances = onp.einsum(
+            "nij,njk,nlk->nil", Rs, onp.eye(3)[None, :, :] * scales[:, None, :] ** 2, Rs
+        )
+        if center:
+            positions -= onp.mean(positions, axis=0, keepdims=True)
+
+        num_gaussians = len(v)
+        print(
+            f"PLY file with {num_gaussians=} loaded in {time.time() - start_time} seconds"
+        )
+        return {
+            "centers": positions,
+            "rgbs": colors,
+            "opacities": opacities,
+            "covariances": covariances,
+        }
+        
+    def convert_cameras(self, dir_name: str = None):
+        # Convert nerfstudio camera definitions to inria gsplat format
+        dataparser_outputs = self.datamanager.train_dataparser_outputs
+        cameras = dataparser_outputs.cameras
+        
+        camera_list = []
+        nerfc2py3d = np.array([[0., 1., 0., 0.], [1., 0., 0., 0.], [0., 0., -1., 0.], [0., 0., 0., 1.]])
+        mat = np.array([[0., -1., 0., 0.], [1., 0., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]])
+        inv_mat = nerfc2py3d@mat
+        
+        tf_mat = np.eye(4)
+        tf_mat[:3,] = np.array(dataparser_outputs.dataparser_transform)
+        
+        assert self.datamanager.config.data.exists(), f"Data directory {self.datamanager.config.data} does not exist."
+
+        if self.datamanager.config.data.suffix == ".json":
+            meta = load_from_json(self.datamanager.config.data)
+            data_dir = self.datamanager.config.data.parent
+        else:
+            meta = load_from_json(self.datamanager.config.data / "transforms.json")
+            data_dir = self.datamanager.config.data
+        
+        # sort the frames by fname
+        fnames = []
+        orig_poses = []
+        for frame in meta["frames"]:
+            filepath = Path(frame["file_path"])
+            fname = self.datamanager.dataparser._get_fname(filepath, data_dir)
+            fnames.append(fname)
+        inds = np.argsort(fnames)
+        frames = [meta["frames"][ind] for ind in inds]
+
+        for frame in frames:
+            orig_poses.append(np.array(frame["transform_matrix"]))
+        orig_poses = torch.from_numpy(np.array(orig_poses).astype(np.float32))
+        
+        for idx, camera in enumerate(cameras):
+            camera.metadata = {"cam_idx": idx}
+            camera_dict = {}
+            camera_dict['id'] = idx
+            camera_dict['img_name'] = str(dataparser_outputs.image_filenames[idx]).split('/')[-1][:-4]
+            camera_dict['width'] = int(camera.width)
+            camera_dict['height'] = int(camera.height)
+            camera_dict['fx'] = float(camera.fx)
+            camera_dict['fy'] = float(camera.fy)
+            camera_dict['cx'] = float(camera.cx)
+            camera_dict['cy'] = float(camera.cy)
+            
+            camera.camera_to_worlds = camera.camera_to_worlds.unsqueeze(0)
+            # import pdb; pdb.set_trace()
+            # ctw_copy = camera.camera_to_worlds.clone()
+            # camopt_camera = self.model.camera_optimizer.apply_to_camera(camera).squeeze(0).cpu().detach()
+            # camopt_copy = camopt_camera.clone()
+            
+            # if (ctw_copy.eq(camopt_copy)).any():
+            #     print("[WARNING]: Cam-opt pose was not applied when generating cameras.json.")
+            
+            T = np.eye(4)
+            T[:3,] = np.array(camera.camera_to_worlds)
+            
+            if hasattr(self, 'server'):
+                self.server.scene.add_frame(name=f"/cameras_original/{str(dataparser_outputs.image_filenames[idx]).split('/')[-1][:-4]}", 
+                                            position = vtf.SE3.from_matrix(orig_poses[idx]).wxyz_xyz[4:], 
+                                            wxyz = vtf.SE3.from_matrix(orig_poses[idx]).wxyz_xyz[:4],
+                                            axes_length=0.04,
+                                            axes_radius=0.003
+                                            )
+                
+                self.server.scene.add_frame(name=f"/cameras_ns/{str(dataparser_outputs.image_filenames[idx]).split('/')[-1][:-4]}", 
+                                            position = vtf.SE3.from_matrix(T).wxyz_xyz[4:], 
+                                            wxyz = vtf.SE3.from_matrix(T).wxyz_xyz[:4],
+                                            axes_length=0.08*dataparser_outputs.dataparser_scale,
+                                            axes_radius=0.005
+                                            )
+
+            newT = T
+            
+            if self.config.rescale_mesh_to_world:
+                newT[:3, 3] = newT[:3,3] / np.array(dataparser_outputs.dataparser_scale)
+                newT = np.linalg.inv(tf_mat) @ newT
+            
+            
+            if hasattr(self, 'server'):
+                self.server.scene.add_frame(name=f"/cameras_inria/{str(dataparser_outputs.image_filenames[idx]).split('/')[-1][:-4]}", 
+                                            position = vtf.SE3.from_matrix(newT).wxyz_xyz[4:], 
+                                            wxyz = vtf.SE3.from_matrix(newT).wxyz_xyz[:4],
+                                            axes_length=0.04,
+                                            axes_radius=0.003
+                                            )
+            newT = newT @ inv_mat
+            
+            
+            camera_dict['position'] = newT[:3,3].tolist()
+            camera_dict['rotation'] = newT[:3,:3].tolist()
+            camera_list.append(camera_dict)
+        
+        if dir_name is not None:
+            with open(self.state_dir / dir_name / 'cameras.json', 'w') as f:
+                json.dump(camera_list, f)
+        else:
+            with open(self.state_dir / 'cameras.json', 'w') as f:
+                json.dump(camera_list, f)
+            
+    def save_rendered_images(self, dir_name: str = None):
+        assert self.cluster_labels is None, "Cluster the scene first."
+        assert self.model.training == False, "Model is still training, cannot save images."
+        dataparser_outputs = self.datamanager.train_dataset._dataparser_outputs
+        cameras = dataparser_outputs.cameras # Without distortion?
+        self.model.training = False
+        rgb, depth, foreground_mask, rgba, img_paths = render_trajectory(self, cameras, 'rgb', 'depth', return_rgba_images=True, rgba_real_images=True)
+        if dir_name is not None:
+            img_dir = os.path.join(self.state_dir, dir_name, f"images")
+            rgba_dir = os.path.join(self.state_dir, dir_name, f"rgba")
+            mask_dir = os.path.join(self.state_dir, dir_name, f"masks")
+        else:
+            img_dir = os.path.join(self.state_dir, f"images")
+            rgba_dir = os.path.join(self.state_dir, f"rgba")
+            mask_dir = os.path.join(self.state_dir, f"masks")
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(rgba_dir, exist_ok=True)
+        os.makedirs(mask_dir, exist_ok=True)
+        for idx, mask in enumerate(foreground_mask):
+            mask = Image.fromarray((mask * 255).astype(np.uint8))
+            mask.save(os.path.join(mask_dir, f"{img_paths[idx].stem}.jpg.png"))
+                    
+        for idx, img in enumerate(rgba):
+            img = Image.fromarray((img * 255).cpu().detach().numpy().astype(np.uint8))
+            img.save(os.path.join(rgba_dir, f"{img_paths[idx].stem}.png"))
+        
+        for idx, img in enumerate(rgb):
+            img = Image.fromarray((img * 255).astype(np.uint8))
+            img.save(os.path.join(img_dir, f"{img_paths[idx].stem}.png"))
+        
+        
+            
+            

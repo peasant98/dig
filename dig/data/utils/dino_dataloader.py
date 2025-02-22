@@ -20,7 +20,7 @@ def get_img_resolution(H, W, p=14):
     return new_H, new_W
 
 class DinoDataloader(FeatureDataloader):
-    dino_model_type = "dinov2_vitb14"
+    dino_model_type = "dinov2_vitb14_reg"
     dino_stride = 14
     dino_layer = 11
     dino_facet = "key"

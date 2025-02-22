@@ -22,17 +22,37 @@ class DiGModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: DiGModel)
     dim: int = 96
     """Output dimension of the feature rendering"""
-    rasterize_mode: Literal["classic", "antialiased"] = "classic"
     dino_rescale_factor: int = 5
     """
     How much to upscale rendered dino for supervision
     """
     num_downscales: int = 0
+    n_split_samples: int = 4
+    """number of samples to split gaussians into"""
+    sh_degree: int = 3
+    """maximum degree of spherical harmonics to use"""
+    sh_degree_interval: int = 500
+    """every n intervals turn on another sh degree"""
     gaussian_dim: int = 64
     """Dimension the gaussians actually store as features"""
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     """If True, use bilateral grid to handle the ISP changes in the image space. This technique was introduced in the paper 'Bilateral Guided Radiance Field Processing' (https://bilarfpro.github.io/)."""
+    use_scale_regularization: bool = True
+    """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
+    max_gauss_ratio: float = 1.5
+    """threshold of ratio of gaussian max to min scale before applying regularization"""
+    grid_shape: Tuple[int, int, int] = (16, 16, 8)
+    """Shape of the bilateral grid (X, Y, W)"""
+    strategy: Literal["default", "mcmc"] = "default"
+    """The default strategy will be used if strategy is not specified. Other strategies, e.g. mcmc, can be used."""
+    mcmc_opacity_reg: float = 0.001
+    """Regularization term for opacity in MCMC strategy. Only enabled when using MCMC strategy"""
+    mcmc_scale_reg: float = 0.03
+    """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
+    max_gs_num: int = 250_000
+    """Maximum number of GSs. Default to 1_000_000."""
+    
     
 class DiGModel(SplatfactoModel):
     config: DiGModelConfig
@@ -139,7 +159,11 @@ class DiGModel(SplatfactoModel):
             print("Called get_outputs with not a camera")
             return {}
 
+        # ctw_copy = camera.camera_to_worlds.clone()
         optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)[0, ...]
+        # camopt_copy = optimized_camera_to_world.clone().unsqueeze(0)
+        # if (ctw_copy.eq(camopt_copy)).any() and rgb_only:
+        #     print("[WARNING]: Cam-opt pose was not applied when rendering outputs.")
 
         # get the background color
         if self.training:
@@ -313,3 +337,12 @@ class DiGModel(SplatfactoModel):
             if self.step>1000:
                 loss_dict['dino_nn_loss'] = .01*self.gauss_params['dino_feats'][self.nearest_ids].var(dim=1).sum()
         return loss_dict
+    
+    def get_rgba_image(self, outputs, output_name = "rgb"):
+        rgb = outputs[output_name]
+        if rgb.any() > 1.0:
+            rgb = rgb / 255.0
+            
+        alpha = outputs["accumulation"] > 0.8
+        rgba = torch.cat([rgb, alpha], dim=-1)
+        return rgba
