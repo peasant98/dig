@@ -912,6 +912,7 @@ class DiGPipeline(VanillaPipeline):
                 map_to_tensors[f"scale_{i}"] = scales[:, i, None]
 
             quats = self.model.quats.data.cpu().numpy()
+            quats = quats / np.linalg.norm(quats, axis=-1, keepdims=True)
             for i in range(4):
                 map_to_tensors[f"rot_{i}"] = quats[:, i, None]
 
@@ -978,7 +979,6 @@ class DiGPipeline(VanillaPipeline):
             
 
         ExportGaussianSplat.write_ply(str(out_file), count, map_to_tensors)
-        
 
         splat_data = self.load_ply_file(out_file, center=False)
         if hasattr(self, 'server'):
@@ -990,7 +990,6 @@ class DiGPipeline(VanillaPipeline):
                 covariances=splat_data["covariances"],
             )
 
-    
     class SplatFile(TypedDict):
         """Data loaded from an antimatter15-style splat file."""
 

@@ -145,7 +145,7 @@ class DiGModel(SplatfactoModel):
         gps['nn_projection'] = list(self.nn.parameters())
         return gps
 
-    def get_outputs(self, camera: Cameras, obj_id: int = None, invert_crop: bool = False, rgb_only: bool = False) -> Dict[str, Union[torch.Tensor, List]]:
+    def get_outputs(self, camera: Cameras, obj_id: Union[int, List[int]] = None, invert_crop: bool = False, rgb_only: bool = False) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a Ray Bundle and returns a dictionary of outputs.
 
         Args:
@@ -199,11 +199,16 @@ class DiGModel(SplatfactoModel):
         
         if obj_id is not None:
             assert self.cluster_labels is not None
-            if invert_crop:
-                crop_ids = torch.where(self.cluster_labels != obj_id)[0]
+            if isinstance(obj_id, list):
+                obj_ids = torch.tensor(obj_id, device=self.cluster_labels.device)
             else:
-                crop_ids = torch.where(self.cluster_labels == obj_id)[0]
+                obj_ids = torch.tensor([obj_id], device=self.cluster_labels.device)
 
+            if invert_crop:
+                crop_ids = torch.where(~torch.isin(self.cluster_labels, obj_ids))[0]
+            else:
+                crop_ids = torch.where(torch.isin(self.cluster_labels, obj_ids))[0]
+                
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
             means_crop = self.means[crop_ids]

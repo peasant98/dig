@@ -13,3 +13,4 @@ include = ["dig*"]
 
 [project.entry-points.'nerfstudio.method_configs']
 dig = 'dig.dig_config:dig_method'
+2dgs = 'dig.dig_config:twodgs_method'

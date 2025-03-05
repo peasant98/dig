@@ -33,6 +33,7 @@ from torch import Tensor
 from dig.exporter.exporter_utils import Mesh, render_trajectory
 from nerfstudio.pipelines.base_pipeline import Pipeline
 from nerfstudio.utils.rich_utils import CONSOLE
+import open3d as o3d
 
 TORCH_DEVICE = Union[torch.device, str]
 
@@ -285,7 +286,7 @@ def export_tsdf_mesh(
     use_bounding_box: bool = False,
     bounding_box_min: Tuple[float, float, float] = (-1.0, -1.0, -1.0),
     bounding_box_max: Tuple[float, float, float] = (1.0, 1.0, 1.0),
-    refine_mesh_using_initial_aabb_estimate: bool = True,
+    refine_mesh_using_initial_aabb_estimate: bool = False,
     refinement_epsilon: float = 1e-2,
 ) -> None:
     """Export a TSDF mesh from a pipeline.
@@ -363,7 +364,24 @@ def export_tsdf_mesh(
 
     CONSOLE.print("Computing Mesh")
     mesh = tsdf.get_mesh()
-
+    def to_o3d_mesh(m):
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(m.vertices.cpu().numpy())
+        mesh.triangles = o3d.utility.Vector3iVector(m.faces.cpu().numpy())
+        mesh.vertex_colors = o3d.utility.Vector3dVector(m.colors.cpu().numpy())
+        mesh.vertex_normals = o3d.utility.Vector3dVector(m.normals.cpu().numpy())
+        return mesh
+    def from_o3d_mesh(mesh: o3d.geometry.TriangleMesh) -> Mesh:
+        vertices = torch.tensor(np.asarray(mesh.vertices), dtype=torch.float32)
+        faces = torch.tensor(np.asarray(mesh.triangles), dtype=torch.float32)
+        normals = torch.tensor(np.asarray(mesh.vertex_normals), dtype=torch.float32)
+        colors = torch.tensor(np.asarray(mesh.vertex_colors), dtype=torch.float32)
+        return Mesh(vertices=vertices, faces=faces, normals=normals, colors=colors)
+        
+    mesh = to_o3d_mesh(mesh)
+    mesh = post_process_mesh(mesh)
+    mesh = from_o3d_mesh(mesh)
+    
     if refine_mesh_using_initial_aabb_estimate:
         CONSOLE.print("Refining the TSDF based on the Mesh AABB")
 
@@ -391,3 +409,26 @@ def export_tsdf_mesh(
     filename = str(output_dir / "tsdf_mesh.ply")
     tsdf.export_mesh(mesh, filename=filename)
     CONSOLE.print(f"Saved TSDF Mesh to {filename}")
+    
+def post_process_mesh(mesh, cluster_to_keep=1000):
+    """
+    Post-process a mesh to filter out floaters and disconnected parts
+    """
+    import copy
+    print("post processing the mesh to have {} clusterscluster_to_kep".format(cluster_to_keep))
+    mesh_0 = copy.deepcopy(mesh)
+    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
+            triangle_clusters, cluster_n_triangles, cluster_area = (mesh_0.cluster_connected_triangles())
+
+    triangle_clusters = np.asarray(triangle_clusters)
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+    cluster_area = np.asarray(cluster_area)
+    n_cluster = np.sort(cluster_n_triangles.copy())[-cluster_to_keep]
+    n_cluster = max(n_cluster, 50) # filter meshes smaller than 50
+    triangles_to_remove = cluster_n_triangles[triangle_clusters] < n_cluster
+    mesh_0.remove_triangles_by_mask(triangles_to_remove)
+    mesh_0.remove_unreferenced_vertices()
+    mesh_0.remove_degenerate_triangles()
+    print("num vertices raw {}".format(len(mesh.vertices)))
+    print("num vertices post {}".format(len(mesh_0.vertices)))
+    return mesh_0
