@@ -99,7 +99,7 @@ def render_trajectory(
             camera = cameras[camera_idx:camera_idx + 1].to(device=pipeline.device)
             with torch.no_grad():
                 assert isinstance(pipeline, VanillaPipeline), "Pipeline must be a DiGPipeline"
-                # camera.metadata = {"cam_idx": camera_idx}
+                camera.metadata = {"cam_idx": camera_idx}
                 outputs = pipeline.model.get_outputs(camera, rgb_only=True)
             if rgb_output_name not in outputs:
                 CONSOLE.rule("Error", style="red")

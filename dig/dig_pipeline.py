@@ -79,7 +79,7 @@ class DigPipelineConfig(VanillaPipelineConfig):
     """Gaussian Splatting, but also loading GARField grouping field from ckpt."""
     _target: Type = field(default_factory=lambda: DiGPipeline)
     garfield_ckpt: Optional[Path] = None  # Need to specify config.yml
-    filter_table_plane: Optional[bool] = False
+    filter_table_plane: Optional[bool] = True
     rescale_mesh_to_world: Optional[bool] = True
     garfield_scales: int = 40
 
@@ -152,8 +152,12 @@ class DiGPipeline(VanillaPipeline):
             self.z_cluster_scene_shuffle_colors = ViewerButton(name="Reshuffle Cluster Colors", cb_hook=self._reshuffle_cluster_colors, disabled=False, visible=False)
             self.cluster_labels = None
 
-            self.click_save_state_rigid = ViewerButton(name="Save Rigid-Body State", cb_hook=self._save_state_rigid, disabled=True, )
+            self.click_save_state_rigid = ViewerButton(name="Save Rigid-Body State", cb_hook=self._save_state_rigid, disabled=True, visible=False)
             
+            self.click_save_state = ViewerButton(name="Save Articulated Body State", cb_hook=self._save_state, disabled=True, visible=True)
+            self.toggle_rgb_cluster = ViewerButton(name="Toggle RGB/Cluster", cb_hook=self._togglergbcluster, disabled=True, visible=True)
+            self.rgb1_cluster0 = True
+
             self.d_reset_state = ViewerButton(name="Undo", cb_hook=self._reset_state, disabled=True)
 
             dataset_name = config.datamanager.data.stem
@@ -200,9 +204,22 @@ class DiGPipeline(VanillaPipeline):
     def has_garfield(self):
         return 'garfield_pipeline' in self.__dict__
 
-    def save_state(self, _):
+    def _save_state(self, _):
         """Save the current state of the model."""
         print("Saving state...")
+        
+        # If we're currently in cluster view, switch back to RGB view first
+        # to ensure we save and render with the actual RGB values
+        was_in_cluster_view = False
+        if hasattr(self, 'rgb1_cluster0') and not self.rgb1_cluster0:
+            if hasattr(self, 'original_features_dc') and hasattr(self, 'original_features_rest'):
+                self.model.gauss_params['features_dc'] = self.original_features_dc
+                self.model.gauss_params['features_rest'] = self.original_features_rest
+                self.rgb1_cluster0 = True
+                was_in_cluster_view = True
+                print("Switched to RGB view before saving state")
+                self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
+        
         #save the current state
         params_to_save = {}
         for k, v in self.model.gauss_params.items():
@@ -213,10 +230,45 @@ class DiGPipeline(VanillaPipeline):
 
         torch.save(params_to_save, self.state_file)
         print(f"State saved to {self.state_file}")
-        self.write_state_to_ply()
-        self.save_rendered_images()
-        self.convert_cameras()
         
+        # Save separate folders for each sub-part if we have cluster labels
+        if self.cluster_labels is not None:
+            unique_labels = self.cluster_labels.unique().int()
+            for label in unique_labels:
+                # Create a directory for this sub-part
+                # import pdb; pdb.set_trace()
+                sub_part_dir = self.state_dir / f"{self.state_dir.stem}_sub_part_{label.item()}"
+                os.makedirs(sub_part_dir, exist_ok=True)
+
+                # Save rendered images for this sub-part
+                # We need to temporarily modify the model to only include this sub-part
+                original_params = {k: v.clone() for k, v in self.model.gauss_params.items()}
+                for k, v in self.model.gauss_params.items():
+                    mask = self.cluster_labels == label
+                    self.model.gauss_params[k] = v[mask]
+                    
+                self.write_state_to_ply(dir_name=f"{self.state_dir.stem}_sub_part_{label.item()}")
+                
+                # Save rendered images
+                self.save_rendered_images(dir_name=f"{self.state_dir.stem}_sub_part_{label.item()}")
+                
+                # Restore original parameters
+                for k, v in original_params.items():
+                    self.model.gauss_params[k] = v
+                
+                # Save cameras (same for all sub-parts)
+                self.convert_cameras(dir_name=f"{self.state_dir.stem}_sub_part_{label.item()}")
+                
+                print(f"Saved sub-part {label.item()} to {sub_part_dir}")
+        
+        # If we were in cluster view, switch back to it
+        if was_in_cluster_view:
+            self.model.gauss_params['features_dc'] = self.cluster_features_dc
+            self.model.gauss_params['features_rest'] = self.cluster_features_rest
+            self.rgb1_cluster0 = False
+            print("Switched back to cluster view after saving state")
+            self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
+
     def _save_state_rigid(self, button: ViewerButton):
         from datetime import datetime
         """Save the current state of the model."""
@@ -238,7 +290,7 @@ class DiGPipeline(VanillaPipeline):
         self.write_state_to_ply(dir_name = str(pathlibstr.with_suffix("")))
         self.save_rendered_images(dir_name = str(pathlibstr.with_suffix("")))
         self.convert_cameras(dir_name = str(pathlibstr.with_suffix("")))
-        # export_tsdf_mesh(self, output_dir = self.state_dir / pathlibstr.with_suffix("")) # Poor quality mesh, use SuGaR pipeline instead
+        export_tsdf_mesh(self, output_dir = self.state_dir / pathlibstr.with_suffix("")) # Poor quality mesh, use SuGaR pipeline instead
         self.click_save_state_rigid.set_disabled(True)
         
     def load_state(self, state_path_filename: str | list[str] = None):
@@ -321,6 +373,7 @@ class DiGPipeline(VanillaPipeline):
 
         self.cluster_scene_z.set_hidden((not hide_in_interactive))
         self.cluster_scene_scale.set_hidden((not hide_in_interactive))
+        self.click_save_state.set_hidden((not hide_in_interactive))
         self.z_cluster_scene_shuffle_colors.set_hidden((not hide_in_interactive))
 
         self.click_gaussian.set_hidden(hide_in_interactive)
@@ -353,6 +406,8 @@ class DiGPipeline(VanillaPipeline):
         self.cluster_labels = None
         self.cluster_scene_z.set_disabled(False)
         self.click_save_state_rigid.set_disabled(True)
+        
+        self.click_save_state.set_disabled(True)
 
     def _queue_state(self):
         """Save current state to stack"""
@@ -447,7 +502,7 @@ class DiGPipeline(VanillaPipeline):
             self.combine_clusters_button.set_disabled(True)
             self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
             self._reshuffle_cluster_colors(None)
-            self.save_state(None)
+            # self.save_state(None)
         else:
             print("Need to have two clicks in history to combine clusters.")
             return
@@ -468,7 +523,34 @@ class DiGPipeline(VanillaPipeline):
 
         # get the closest point to the sphere, using kdtree
         return inds
+
+    def _togglergbcluster(self, button: ViewerButton):
+        """Toggle between RGB view and cluster colormap view"""
+        if self.cluster_labels is None:
+            print("No clusters available. Please cluster the scene first.")
+            return
+            
+        self.rgb1_cluster0 = not self.rgb1_cluster0
         
+        if self.rgb1_cluster0:
+            # Switch to RGB view
+            if hasattr(self, 'original_features_dc') and hasattr(self, 'original_features_rest'):
+                self.model.gauss_params['features_dc'] = self.original_features_dc
+                self.model.gauss_params['features_rest'] = self.original_features_rest
+                print("Switched to RGB view")
+            else:
+                print("Original RGB values not available")
+        else:
+            # Switch to cluster colormap view
+            if hasattr(self, 'cluster_features_dc') and hasattr(self, 'cluster_features_rest'):
+                self.model.gauss_params['features_dc'] = self.cluster_features_dc
+                self.model.gauss_params['features_rest'] = self.cluster_features_rest
+                print("Switched to cluster colormap view")
+            else:
+                print("Cluster colormap not available")
+                
+        self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
+
     def _estimate_table_plane(self, means):
         points = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(means.cpu().numpy()))
         # First segment the plane
@@ -594,9 +676,6 @@ class DiGPipeline(VanillaPipeline):
             # kept_opacities = opacities[keeps]
             # kept_scales = scales[keeps]
 
-            # opacity_threshold = kept_opacities.mean() - torch.tensor(np.log(2.5))
-            # scale_threshold = kept_scales.mean() + torch.tensor(np.log(2.0))
-
             # # Create masks for the filtered subset (already on CPU)
             # opacity_mask = (kept_opacities > opacity_threshold).squeeze()
             # scale_mask = kept_scales < scale_threshold
@@ -627,7 +706,7 @@ class DiGPipeline(VanillaPipeline):
                 )
 
                 if len(curr_points_ds_ids) == keeps.shape[0]:
-                    clusters = np.asarray(keep_points.cluster_dbscan(eps=0.1, min_points=3)) # Used to be 0.02 and 5
+                    clusters = np.asarray(keep_points.cluster_dbscan(eps=0.02, min_points=5)) # Used to be 0.02 and 5
                 
                 else:
                     curr_points_ds_ids = np.array([points[0] for points in curr_points_ds_ids])
@@ -635,7 +714,7 @@ class DiGPipeline(VanillaPipeline):
                     curr_points_ds_selected = np.zeros(len(keep_points.points), dtype=bool)
                     curr_points_ds_selected[curr_points_ds_ids] = True
 
-                    _clusters = np.asarray(curr_points_ds.cluster_dbscan(eps=0.05, min_points=3))
+                    _clusters = np.asarray(curr_points_ds.cluster_dbscan(eps=0.02, min_points=5))
                     nn_model = NearestNeighbors(
                         n_neighbors=1, algorithm="auto", metric="euclidean"
                     ).fit(np.asarray(curr_points_ds.points))
@@ -651,7 +730,7 @@ class DiGPipeline(VanillaPipeline):
                     clusters[~curr_points_ds_selected] = _clusters[indices[:, 0]]
 
             else:
-                clusters = np.asarray(keep_points.cluster_dbscan(eps=0.05, min_points=5))
+                clusters = np.asarray(keep_points.cluster_dbscan(eps=0.02, min_points=5))
             # import pdb; pdb.set_trace()
             # clusters = np.asarray(keep_points)
             
@@ -728,17 +807,27 @@ class DiGPipeline(VanillaPipeline):
 
         labels = self.cluster_labels
 
-        features_dc = self.model.gauss_params['features_dc'].detach()
-        features_rest = self.model.gauss_params['features_rest'].detach()
+        # Create new cluster colormap features
+        features_dc = self.model.gauss_params['features_dc'].detach().clone()
+        features_rest = self.model.gauss_params['features_rest'].detach().clone()
+        
         for c_id in range(0, labels.max().int().item() + 1):
             # set the colors of the gaussians accordingly using colormap from matplotlib
             cluster_mask = np.where(labels == c_id)
             features_dc[cluster_mask] = RGB2SH(colormap[c_id, :3].to(self.model.gauss_params['features_dc']))
             features_rest[cluster_mask] = 0
 
-        self.model.gauss_params['features_dc'] = torch.nn.Parameter(self.model.gauss_params['features_dc'])
-        self.model.gauss_params['features_rest'] = torch.nn.Parameter(self.model.gauss_params['features_rest'])
+        # Update stored cluster colormap features
+        self.cluster_features_dc = torch.nn.Parameter(features_dc)
+        self.cluster_features_rest = torch.nn.Parameter(features_rest)
+        
+        # If currently in cluster view, update the display
+        if not self.rgb1_cluster0:
+            self.model.gauss_params['features_dc'] = self.cluster_features_dc
+            self.model.gauss_params['features_rest'] = self.cluster_features_rest
+            
         self.z_cluster_scene_shuffle_colors.set_disabled(False)
+        self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
 
     def _cluster_scene(self, button: ViewerButton):
         """Cluster the scene, and assign gaussian colors based on the clusters.
@@ -746,6 +835,16 @@ class DiGPipeline(VanillaPipeline):
 
         self._queue_state()  # Save current state
         self.cluster_scene_z.set_disabled(True)  # Disable user from clustering, while clustering
+
+        # If we're currently in cluster view, switch back to RGB view first
+        # to ensure we store the actual RGB values, not the colormap values
+        if hasattr(self, 'rgb1_cluster0') and not self.rgb1_cluster0:
+            if hasattr(self, 'original_features_dc') and hasattr(self, 'original_features_rest'):
+                self.model.gauss_params['features_dc'] = self.original_features_dc
+                self.model.gauss_params['features_rest'] = self.original_features_rest
+                self.rgb1_cluster0 = True
+                print("Switched to RGB view before clustering")
+                self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
 
         scale = self.cluster_scene_scale.value
         grouping_model = self.garfield_pipeline[0].model
@@ -840,23 +939,38 @@ class DiGPipeline(VanillaPipeline):
         self.num_clusters.set_hidden(False)
         self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
         
-        features_dc = self.model.gauss_params['features_dc'].detach()
-        features_rest = self.model.gauss_params['features_rest'].detach()
+        # Store original RGB values before applying cluster colors
+        self.original_features_dc = self.model.gauss_params['features_dc'].detach().clone()
+        self.original_features_rest = self.model.gauss_params['features_rest'].detach().clone()
+        
+        # Create cluster colormap features
+        features_dc = self.model.gauss_params['features_dc'].detach().clone()
+        features_rest = self.model.gauss_params['features_rest'].detach().clone()
+        
         for c_id in range(0, labels.max() + 1):
             # set the colors of the gaussians accordingly using colormap from matplotlib
             cluster_mask = np.where(labels == c_id)
             features_dc[cluster_mask] = RGB2SH(colormap[c_id, :3].to(self.model.gauss_params['features_dc']))
             features_rest[cluster_mask] = 0
-
-        self.model.gauss_params['features_dc'] = torch.nn.Parameter(self.model.gauss_params['features_dc'])
-        self.model.gauss_params['features_rest'] = torch.nn.Parameter(self.model.gauss_params['features_rest'])
+        
+        # Store cluster colormap features
+        self.cluster_features_dc = torch.nn.Parameter(features_dc)
+        self.cluster_features_rest = torch.nn.Parameter(features_rest)
+        
+        # Set initial view to cluster colormap
+        self.model.gauss_params['features_dc'] = self.cluster_features_dc
+        self.model.gauss_params['features_rest'] = self.cluster_features_rest
+        self.rgb1_cluster0 = False  # Start with cluster view
 
         self.cluster_scene_z.set_disabled(False)
         self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
         self.click_gaussian.set_disabled(False)
         
-        self.save_state(None)
+        # Enable the toggle button
+        self.toggle_rgb_cluster.set_disabled(False)
+        self.click_save_state.set_disabled(False)
         
+        # self.save_state(None)
         
     def write_state_to_ply(self, dir_name: str = None, file_name: str = "point_cloud.ply"):
         if dir_name is not None:
@@ -1083,14 +1197,7 @@ class DiGPipeline(VanillaPipeline):
             camera_dict['cy'] = float(camera.cy)
             
             camera.camera_to_worlds = camera.camera_to_worlds.unsqueeze(0)
-            # import pdb; pdb.set_trace()
-            # ctw_copy = camera.camera_to_worlds.clone()
-            # camopt_camera = self.model.camera_optimizer.apply_to_camera(camera).squeeze(0).cpu().detach()
-            # camopt_copy = camopt_camera.clone()
-            
-            # if (ctw_copy.eq(camopt_copy)).any():
-            #     print("[WARNING]: Cam-opt pose was not applied when generating cameras.json.")
-            
+
             T = np.eye(4)
             T[:3,] = np.array(camera.camera_to_worlds)
             
@@ -1138,7 +1245,8 @@ class DiGPipeline(VanillaPipeline):
                 json.dump(camera_list, f)
             
     def save_rendered_images(self, dir_name: str = None):
-        assert self.cluster_labels is None, "Cluster the scene first."
+        # import pdb; pdb.set_trace()
+        # assert self.cluster_labels is not None, "Cluster the scene first."
         assert self.model.training == False, "Model is still training, cannot save images."
         dataparser_outputs = self.datamanager.train_dataset._dataparser_outputs
         cameras = dataparser_outputs.cameras # Without distortion?

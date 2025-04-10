@@ -196,7 +196,7 @@ class TwodgsModelConfig(ModelConfig):
     """maximum degree of spherical harmonics to use"""
     use_scale_regularization: bool = True
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
-    max_gauss_ratio: float = 5.0
+    max_gauss_ratio: float = 3.0
     """threshold of ratio of gaussian max to min scale before applying regularization
     loss from the PhysGaussian paper
     """
@@ -222,9 +222,9 @@ class TwodgsModelConfig(ModelConfig):
     """If True, apply color correction to the rendered images before computing the metrics."""
     use_normal_loss: bool = True
     """Enable normal consistency loss. [2DGS experimental]"""
-    normal_lambda: float = 8e-2
+    normal_lambda: float = 1e-1
     """Weight for normal loss"""
-    normal_start_iter: int = 5_000
+    normal_start_iter: int = 3_000
     """Iteration to start normal consistency regulerization"""
     use_dist_loss: bool = True
     """Distortion loss [2DGS experimental]"""
@@ -749,7 +749,7 @@ class TwodgsModel(Model):
                 )
                 - self.config.max_gauss_ratio
             )
-            scale_reg = 0.1 * scale_reg.mean()
+            scale_reg = 0.6 * scale_reg.mean()
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
 

@@ -9,6 +9,7 @@ from gsplat.rendering import rasterization
 from nerfstudio.model_components import renderers
 from nerfstudio.viewer.viewer_elements import *
 from dig.data.utils.dino_dataloader import get_img_resolution,MAX_DINO_SIZE
+from nerfstudio.models.splatfacto import RGB2SH, SH2RGB
 from torchvision.transforms.functional import resize
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 
@@ -16,6 +17,18 @@ from collections import OrderedDict
 import torch
 from nerfstudio.models.splatfacto import get_viewmat
 import torch.nn.functional as F
+import numpy as np
+import cv2
+
+def generate_random_colors(N=5000) -> torch.Tensor:
+    """Generate random colors for visualization"""
+    hs = np.random.uniform(0, 1, size=(N, 1))
+    ss = np.random.uniform(0.6, 0.61, size=(N, 1))
+    vs = np.random.uniform(0.84, 0.95, size=(N, 1))
+    hsv = np.concatenate([hs, ss, vs], axis=-1)
+    # convert to rgb
+    rgb = cv2.cvtColor((hsv * 255).astype(np.uint8)[None, ...], cv2.COLOR_HSV2RGB)
+    return torch.Tensor(rgb.squeeze() / 255.0)
 
 @dataclass
 class DiGModelConfig(SplatfactoModelConfig):
@@ -31,7 +44,7 @@ class DiGModelConfig(SplatfactoModelConfig):
     """number of samples to split gaussians into"""
     sh_degree: int = 3
     """maximum degree of spherical harmonics to use"""
-    sh_degree_interval: int = 500
+    sh_degree_interval: int = 1000
     """every n intervals turn on another sh degree"""
     gaussian_dim: int = 64
     """Dimension the gaussians actually store as features"""
@@ -40,7 +53,7 @@ class DiGModelConfig(SplatfactoModelConfig):
     """If True, use bilateral grid to handle the ISP changes in the image space. This technique was introduced in the paper 'Bilateral Guided Radiance Field Processing' (https://bilarfpro.github.io/)."""
     use_scale_regularization: bool = True
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
-    max_gauss_ratio: float = 1.5
+    max_gauss_ratio: float = 3.0
     """threshold of ratio of gaussian max to min scale before applying regularization"""
     grid_shape: Tuple[int, int, int] = (16, 16, 8)
     """Shape of the bilateral grid (X, Y, W)"""
@@ -63,7 +76,6 @@ class DiGModel(SplatfactoModel):
         torch.inverse(torch.ones((1, 1), device="cuda:0"))# https://github.com/pytorch/pytorch/issues/90613
         self.viewer_control = ViewerControl()
         self.zz_click_gaussian = ViewerButton(name="DINO Query Click", cb_hook=self._click_gaussian)
-        self.click_location = None
         self.click_handle = None
         self.cluster_labels = None
         #convert to torch

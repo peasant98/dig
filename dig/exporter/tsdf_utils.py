@@ -278,11 +278,11 @@ class TSDF:
 def export_tsdf_mesh(
     pipeline: Pipeline,
     output_dir: Path,
-    downscale_factor: int = 1,
+    downscale_factor: int = 2,
     depth_output_name: str = "depth",
     rgb_output_name: str = "rgb",
     resolution: Union[int, List[int]] = 256,
-    batch_size: int = 6,
+    batch_size: int = 10,
     use_bounding_box: bool = False,
     bounding_box_min: Tuple[float, float, float] = (-1.0, -1.0, -1.0),
     bounding_box_max: Tuple[float, float, float] = (1.0, 1.0, 1.0),
