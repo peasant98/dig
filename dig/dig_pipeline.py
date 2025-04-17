@@ -30,7 +30,11 @@ from PIL import Image
 from dig.exporter.exporter_utils import *
 from dig.exporter.tsdf_utils import export_tsdf_mesh
 from dig.scripts.exporter import ExportGaussianSplat, matrix_to_quaternion
+
+import subprocess
 import os
+import sys
+
 import json
 from nerfstudio.utils.io import load_from_json
 import numpy.typing as onpt
@@ -79,7 +83,7 @@ class DigPipelineConfig(VanillaPipelineConfig):
     """Gaussian Splatting, but also loading GARField grouping field from ckpt."""
     _target: Type = field(default_factory=lambda: DiGPipeline)
     garfield_ckpt: Optional[Path] = None  # Need to specify config.yml
-    filter_table_plane: Optional[bool] = True
+    filter_table_plane: Optional[bool] = False
     rescale_mesh_to_world: Optional[bool] = True
     garfield_scales: int = 40
 
@@ -290,7 +294,6 @@ class DiGPipeline(VanillaPipeline):
         self.write_state_to_ply(dir_name = str(pathlibstr.with_suffix("")))
         self.save_rendered_images(dir_name = str(pathlibstr.with_suffix("")))
         self.convert_cameras(dir_name = str(pathlibstr.with_suffix("")))
-        export_tsdf_mesh(self, output_dir = self.state_dir / pathlibstr.with_suffix("")) # Poor quality mesh, use SuGaR pipeline instead
         self.click_save_state_rigid.set_disabled(True)
         
     def load_state(self, state_path_filename: str | list[str] = None):
@@ -352,7 +355,18 @@ class DiGPipeline(VanillaPipeline):
         if self.num_clusters.gui_handle is not None:
             self.num_clusters.set_hidden(False)
             self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
-
+            
+        if self.object_mode == ObjectMode.ARTICULATED:
+            try:
+                # Store original RGB values before applying cluster colors
+                self.original_features_dc = self.model.gauss_params['features_dc'].detach().clone()
+                self.original_features_rest = self.model.gauss_params['features_rest'].detach().clone()
+                
+                self.toggle_rgb_cluster.set_disabled(False)
+                self._reshuffle_cluster_colors(None)
+                self.click_save_state.set_disabled(False)
+            except Exception as e:
+                print(f"No GUI Handle found: {e}")
     
     def reset_colors(self):
         from cuml.neighbors import NearestNeighbors
@@ -645,7 +659,7 @@ class DiGPipeline(VanillaPipeline):
 
         # Iterate over different scales, to get the a range of possible groupings.
         grouping_model = self.garfield_pipeline[0].model
-        for s in tqdm.tqdm(torch.linspace(0, 1.5, self.config.garfield_scales)):
+        for s in tqdm.tqdm(torch.linspace(0, 2.0, self.config.garfield_scales)):
             # Calculate the grouping features, and calculate the affinity between click point and scene
             instances = grouping_model.get_grouping_at_points(positions, s)  # (1+N, 256)
             click_instance = instances[0]
@@ -772,6 +786,7 @@ class DiGPipeline(VanillaPipeline):
         
         self.crop_group_list = keep_list
         self.crop_to_group_level.set_disabled(False)
+        self.click_save_state_rigid.set_visible(True)
         self.click_save_state_rigid.set_disabled(False)
         self.crop_to_group_level.value = self.config.garfield_scales - 1
 
@@ -1251,30 +1266,26 @@ class DiGPipeline(VanillaPipeline):
         dataparser_outputs = self.datamanager.train_dataset._dataparser_outputs
         cameras = dataparser_outputs.cameras # Without distortion?
         self.model.training = False
-        rgb, depth, foreground_mask, rgba, img_paths = render_trajectory(self, cameras, 'rgb', 'depth', return_rgba_images=True, rgba_real_images=True)
+        rgb, depth, foreground_mask, rgba, img_paths = render_trajectory(self, cameras, 'rgb', 'depth', return_rgba_images=True, rgba_real_images=False)
         if dir_name is not None:
             img_dir = os.path.join(self.state_dir, dir_name, f"images")
-            rgba_dir = os.path.join(self.state_dir, dir_name, f"rgba")
+            # rgba_dir = os.path.join(self.state_dir, dir_name, f"rgba")
             mask_dir = os.path.join(self.state_dir, dir_name, f"masks")
         else:
             img_dir = os.path.join(self.state_dir, f"images")
             rgba_dir = os.path.join(self.state_dir, f"rgba")
             mask_dir = os.path.join(self.state_dir, f"masks")
         os.makedirs(img_dir, exist_ok=True)
-        os.makedirs(rgba_dir, exist_ok=True)
+        # os.makedirs(rgba_dir, exist_ok=True)
         os.makedirs(mask_dir, exist_ok=True)
         for idx, mask in enumerate(foreground_mask):
             mask = Image.fromarray((mask * 255).astype(np.uint8))
             mask.save(os.path.join(mask_dir, f"{img_paths[idx].stem}.jpg.png"))
                     
-        for idx, img in enumerate(rgba):
-            img = Image.fromarray((img * 255).cpu().detach().numpy().astype(np.uint8))
-            img.save(os.path.join(rgba_dir, f"{img_paths[idx].stem}.png"))
+        # for idx, img in enumerate(rgba):
+        #     img = Image.fromarray((img * 255).cpu().detach().numpy().astype(np.uint8))
+        #     img.save(os.path.join(rgba_dir, f"{img_paths[idx].stem}.png"))
         
         for idx, img in enumerate(rgb):
             img = Image.fromarray((img * 255).astype(np.uint8))
             img.save(os.path.join(img_dir, f"{img_paths[idx].stem}.png"))
-        
-        
-            
-            

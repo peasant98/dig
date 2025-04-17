@@ -51,9 +51,9 @@ class DiGModelConfig(SplatfactoModelConfig):
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
     use_bilateral_grid: bool = True
     """If True, use bilateral grid to handle the ISP changes in the image space. This technique was introduced in the paper 'Bilateral Guided Radiance Field Processing' (https://bilarfpro.github.io/)."""
-    use_scale_regularization: bool = True
+    use_scale_regularization: bool = False
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
-    max_gauss_ratio: float = 3.0
+    max_gauss_ratio: float = 1.0
     """threshold of ratio of gaussian max to min scale before applying regularization"""
     grid_shape: Tuple[int, int, int] = (16, 16, 8)
     """Shape of the bilateral grid (X, Y, W)"""
@@ -63,7 +63,7 @@ class DiGModelConfig(SplatfactoModelConfig):
     """Regularization term for opacity in MCMC strategy. Only enabled when using MCMC strategy"""
     mcmc_scale_reg: float = 0.03
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
-    max_gs_num: int = 250_000
+    max_gs_num: int = 500_000
     """Maximum number of GSs. Default to 1_000_000."""
     
     
