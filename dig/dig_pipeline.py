@@ -352,9 +352,10 @@ class DiGPipeline(VanillaPipeline):
             print(f"No state file found at {self.state_file} or in {self.state_dir}, unable to load state.")
             return
         
-        if self.num_clusters.gui_handle is not None:
-            self.num_clusters.set_hidden(False)
-            self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
+        # this was causing a bug, freeze for now
+        # if self.num_clusters.gui_handle is not None:
+        #     self.num_clusters.set_hidden(False)
+        #     self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
             
         if self.object_mode == ObjectMode.ARTICULATED:
             try:
@@ -464,6 +465,12 @@ class DiGPipeline(VanillaPipeline):
         outputs = self.model.get_outputs(cam.to(self.device))
         self.model.train()
         with torch.no_grad():
+            # save overall depth to png
+            import matplotlib.pyplot as plt
+            # also save rgb 
+            rgb_map = outputs["rgb"].cpu().numpy()
+            plt.imsave("debug_rgb.png", rgb_map.squeeze())
+
             depth = outputs["depth"][pix_y, pix_x].cpu().numpy()
 
         self.click_location = np.array(click.origin) + np.array(click.direction) * (depth / z_dir)
@@ -523,6 +530,7 @@ class DiGPipeline(VanillaPipeline):
 
     def _click_location_to_gauss_inds(self, top_k=10):
         """Get the closest gaussians to the click location"""
+
         curr_means = self.model.gauss_params['means'].detach()
         self.model.eval()
 
@@ -772,12 +780,15 @@ class DiGPipeline(VanillaPipeline):
             #     prev_group = keeps
             keep_list.append(keeps)
 
+
+
         if len(keep_list) == 0:
             print("No gaussians within crop, aborting")
             # The only way to reset is to reset the state using the reset button.
             self.click_gaussian.set_disabled(False)
             self.crop_to_click.set_disabled(False)
             return
+        
 
         # Remove the click handle + visualization
         self.click_location = None
@@ -788,7 +799,8 @@ class DiGPipeline(VanillaPipeline):
         self.crop_to_group_level.set_disabled(False)
         self.click_save_state_rigid.set_visible(True)
         self.click_save_state_rigid.set_disabled(False)
-        self.crop_to_group_level.value = self.config.garfield_scales - 1
+        # self.crop_to_group_level.value = self.config.garfield_scales - 1
+        print("Done getting cropped Gaussians.")
 
     def _update_crop_vis(self, number: ViewerSlider):
         """Update which click-based crop to visualize -- this requires that _crop_to_click has been called."""
@@ -950,9 +962,7 @@ class DiGPipeline(VanillaPipeline):
         self.model.gauss_params['opacities'] = torch.nn.Parameter(opacities.float())
 
         self.cluster_labels = torch.Tensor(labels)
-        
-        self.num_clusters.set_hidden(False)
-        self.num_clusters.gui_handle.value = len(self.cluster_labels.unique())
+
         
         # Store original RGB values before applying cluster colors
         self.original_features_dc = self.model.gauss_params['features_dc'].detach().clone()
